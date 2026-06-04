@@ -30,24 +30,7 @@ import io
 import json
 import logging
 import os
-import re
 import secrets
-
-# Pre-compiled regex patterns for Gemma 4 output markers.
-# Using re.escape() for markers because raw-string \| is unreliable across Python versions.
-# NOTE: Gemma 4 tool_call markers are ASYMMETRIC:
-#   Opening: <|tool_call>
-#   Closing: <tool_call|>
-_TC_OPEN = re.escape("<|tool_call>")
-_TC_CLOSE = re.escape("<tool_call|>")
-_THINK_MARKER = re.escape("<|think|>")
-_TURN_MARKER = re.escape("<|turn|>")
-RE_THINKING = re.compile(_THINK_MARKER + r"(.*?)" + _TURN_MARKER, re.DOTALL)
-RE_TOOL_CALLS = re.compile(
-    _TC_OPEN + r"call:(\w+)\{(.+?)\}" + _TC_CLOSE, re.DOTALL
-)
-RE_CLEAN_THINKING = re.compile(_THINK_MARKER + r".*?" + _TURN_MARKER, re.DOTALL)
-RE_CLEAN_TOOL_CALLS = re.compile(_TC_OPEN + r".*?" + _TC_CLOSE, re.DOTALL)
 import sqlite3
 import threading
 import time
@@ -780,50 +763,54 @@ def generate_sync(
     with torch.no_grad():
         outputs = model.generate(**inputs_gpu, **gen_kwargs)
 
-    # Decode full output with special tokens for regex extraction
+    # Decode full output WITH special tokens (parse_response needs them)
     full_text = processor.decode(outputs[0], skip_special_tokens=False)
 
-    # DEBUG: log raw output for tool call debugging
-    log.debug(f"[DEBUG] full_text (last 300): ...{full_text[-300:]}")
+    # ── Use transformers' official Gemma 4 response parser ──────────────
+    # parse_response() reads the response_schema from tokenizer_config.json
+    # which contains the official Google regex for tool_calls, thinking, content.
+    # It handles <|\"|> → JSON, unquoted keys, and all Gemma 4 markers.
+    # IMPORTANT: pass only the generated tokens (not the prompt) to avoid
+    # the parser matching the tool declarations in the prompt.
+    generated_ids = outputs[0][input_len:]
+    generated_text = processor.decode(generated_ids, skip_special_tokens=False)
+    parsed = processor.parse_response(generated_text)
 
-    # Decode only generated tokens (skip special tokens) for clean response
-    clean_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+    # Extract parsed fields
+    reasoning_content = parsed.get("thinking")
+    response_text = parsed.get("content") or ""
+    # Strip any remaining special tokens from content
+    for marker in ["<eos>", "<pad>", "<bos>"]:
+        response_text = response_text.replace(marker, "").strip()
 
-    # Extract thinking content (pre-compiled regex with re.escape markers)
-    reasoning_content = None
-    think_match = RE_THINKING.search(full_text)
-    if think_match:
-        reasoning_content = think_match.group(1).strip()
-
-    # Extract tool calls — Gemma 4 uses single braces and <|\"|> for quotes
+    # Convert parsed tool_calls to OpenAI format
     tool_calls = None
-    tc_matches = RE_TOOL_CALLS.findall(full_text)
-    if tc_matches:
+    raw_tool_calls = parsed.get("tool_calls")
+    if raw_tool_calls:
         tool_calls = []
-        for i, (name, args) in enumerate(tc_matches):
-            # Clean up special quote tokens <|\"|> -> "
-            args_clean = args.replace("<|\"|>", '"')
-            tool_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {"name": name, "arguments": args_clean},
-                }
-            )
+        for tc in raw_tool_calls:
+            func = tc.get("function", {})
+            # Arguments come as parsed dict — serialize back to JSON string (OpenAI spec)
+            args_str = json.dumps(func.get("arguments", {}), ensure_ascii=False)
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": func.get("name", ""),
+                    "arguments": args_str,
+                },
+            })
 
-    # Clean up response: remove thinking and tool call markers
-    response = RE_CLEAN_THINKING.sub("", clean_text)
-    response = RE_CLEAN_TOOL_CALLS.sub("", response).strip()
-
+    # Stop sequence truncation
     if stop:
         for seq in stop:
-            idx = response.find(seq)
+            idx = response_text.find(seq)
             if idx != -1:
-                response = response[:idx]
+                response_text = response_text[:idx]
                 break
 
-    comp_tokens = len(processor.tokenizer.encode(response, add_special_tokens=False))
-    return response, input_len, comp_tokens, reasoning_content, tool_calls
+    comp_tokens = len(processor.tokenizer.encode(response_text, add_special_tokens=False))
+    return response_text, input_len, comp_tokens, reasoning_content, tool_calls
 
 
 # ── FastAPI lifespan ──────────────────────────────────────────────────────────
@@ -1132,17 +1119,13 @@ async def _stream_generator(
 
             accumulated = ""
             in_thinking = False
-            in_tool_call = False
-            current_tc_name = ""
-            current_tc_args = ""
-            current_tc_index = -1
             asyncio.run_coroutine_threadsafe(queue.put(("role", input_len)), loop)
 
             for chunk in streamer:
                 if chunk:
                     accumulated += chunk
 
-                    # Detect thinking blocks
+                    # Detect thinking blocks — stream thinking tokens to client
                     if "<|think|>" in chunk:
                         in_thinking = True
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking_start",)), loop)
@@ -1151,80 +1134,34 @@ async def _stream_generator(
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking_end",)), loop)
                     elif in_thinking:
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking", chunk)), loop)
-
-                    # Detect tool calls — markers are asymmetric:
-                    # Opening: <|tool_call>   Closing: <tool_call|>
-                    if "<|tool_call>" in chunk:
-                        # Opening marker — start collecting a new tool call
-                        in_tool_call = True
-                        current_tc_index += 1
-                        current_tc_name = ""
-                        current_tc_args = ""
-                        asyncio.run_coroutine_threadsafe(
-                            queue.put((
-                                "tool_call_start",
-                                current_tc_index,
-                                f"call_{uuid.uuid4().hex[:8]}",
-                            )), loop,
-                        )
-                    elif "<tool_call|>" in chunk:
-                        # Closing marker — finalize this tool call
-                        in_tool_call = False
-                        asyncio.run_coroutine_threadsafe(
-                            queue.put(("tool_call_end",)), loop,
-                        )
-                    elif in_tool_call:
-                        # Accumulate tool call content, extract name and args
-                        current_tc_args += chunk
-                        # Try to detect function name from "call:name{{"
-                        name_match = re.match(r"call:(\w+)\{\{", current_tc_args)
-                        if name_match:
-                            tc_name = name_match.group(1)
-                            if tc_name != current_tc_name:
-                                current_tc_name = tc_name
-                                # Strip the "call:name{{" prefix from args
-                                remaining = current_tc_args[name_match.end():]
-                                asyncio.run_coroutine_threadsafe(
-                                    queue.put(("tool_call_name", current_tc_index, current_tc_name)), loop,
-                                )
-                                if remaining:
-                                    asyncio.run_coroutine_threadsafe(
-                                        queue.put(("tool_call_arg", current_tc_index, remaining)), loop,
-                                    )
-                        else:
-                            # Accumulate raw args text
-                            asyncio.run_coroutine_threadsafe(
-                                queue.put(("tool_call_arg", current_tc_index, chunk)), loop,
-                            )
                     elif not in_thinking:
-                        # Content chunk (not in thinking or tool call)
+                        # Content chunk — stream to client
+                        # (tool call markers pass through as content; parse_response cleans them up at the end)
                         asyncio.run_coroutine_threadsafe(queue.put(("content", chunk)), loop)
 
             thread.join()
 
-            # Parse final accumulated text for thinking and tool calls
-            reasoning_content = None
-            think_match = RE_THINKING.search(accumulated)
-            if think_match:
-                reasoning_content = think_match.group(1).strip()
+            # ── Parse final output using transformers' official Gemma 4 parser ──
+            parsed = processor.parse_response(accumulated)
+            reasoning_content = parsed.get("thinking")
 
             tool_calls = None
-            tc_matches = RE_TOOL_CALLS.findall(accumulated)
-            if tc_matches:
+            raw_tool_calls = parsed.get("tool_calls")
+            if raw_tool_calls:
                 tool_calls = []
-                for i, (name, args) in enumerate(tc_matches):
-                    tool_calls.append(
-                        {
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {"name": name, "arguments": args},
-                        }
-                    )
+                for tc in raw_tool_calls:
+                    func = tc.get("function", {})
+                    args_str = json.dumps(func.get("arguments", {}), ensure_ascii=False)
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": func.get("name", ""), "arguments": args_str},
+                    })
 
             # Clean accumulated for token count
-            clean_accumulated = RE_CLEAN_THINKING.sub("", accumulated)
-            clean_accumulated = RE_CLEAN_TOOL_CALLS.sub("", clean_accumulated)
-            clean_accumulated = clean_accumulated.strip()
+            clean_accumulated = parsed.get("content") or ""
+            for marker in ["<eos>", "<pad>", "<bos>"]:
+                clean_accumulated = clean_accumulated.replace(marker, "").strip()
 
             comp_tokens = len(
                 processor.tokenizer.encode(clean_accumulated, add_special_tokens=False)
@@ -1307,98 +1244,6 @@ async def _stream_generator(
                         ],
                     }),
                 }
-
-            elif tag == "tool_call_start":
-                # OpenAI incremental tool_call: first chunk has id, type, name
-                tc_idx = item[1]
-                tc_id = item[2]
-                if current_tool_calls is None:
-                    current_tool_calls = {}
-                current_tool_calls[tc_idx] = {
-                    "id": tc_id,
-                    "type": "function",
-                    "function": {"name": "", "arguments": ""},
-                }
-                yield {
-                    "event": "message",
-                    "data": json.dumps({
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": tc_idx,
-                                        "id": tc_id,
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }),
-                }
-
-            elif tag == "tool_call_name":
-                tc_idx = item[1]  # index passed from producer
-                if current_tool_calls and tc_idx in current_tool_calls:
-                    tc_name_val = item[2] if len(item) > 2 else ""
-                    current_tool_calls[tc_idx]["function"]["name"] = tc_name_val
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": tc_idx,
-                                            "function": {"name": tc_name_val},
-                                        }]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }),
-                    }
-
-            elif tag == "tool_call_arg":
-                tc_idx = item[1]  # index passed from producer
-                arg_text = item[2]
-                if current_tool_calls and tc_idx in current_tool_calls:
-                    current_tool_calls[tc_idx]["function"]["arguments"] += arg_text
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": tc_idx,
-                                            "function": {"arguments": arg_text},
-                                        }]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }),
-                    }
-
-            elif tag == "tool_call_end":
-                pass  # Final done chunk carries finish_reason
 
             elif tag == "done":
                 total_prompt = item[1]
