@@ -1,8 +1,8 @@
-# nuc-gemma4-vision — Product Requirements Document
+# lowram-gemma4-vision — Product Requirements Document
 
 ## 1. Executive Summary
 
-Plataforma de inferencia multimodal (texto + visión) que corre un modelo Gemma 4 E4B de 15GB en una GPU externa RTX 3060 12GB conectada via Thunderbolt 3 a un Intel NUC7i5BNB con solo 7.6GB de RAM. El sistema utiliza quantización 4-bit NF4 para el backbone de texto y mantiene la visión tower en fp16, logrando ~5-7 tok/s con visión funcional.
+Librería de inferencia multimodal (texto + visión) para correr Gemma 4 E4B (15GB) en hardware con RAM limitada (4GB+) y GPU NVIDIA 12GB+. Usa quantización 4-bit NF4 para texto y fp16 para visión, logrando ~5-7 tok/s. Incluye el fix crítico del `embed_vision` que causa ceguera visual en quantización estándar.
 
 **Diferenciador:** Setup completo y reproducible para correr modelos multimodales grandes en hardware consumer via eGPU, incluyendo el fix crítico del `embed_vision` que causa ceguera en la visión.
 

@@ -1,4 +1,4 @@
-# nuc-gemma4-vision — Implementation Plan
+# lowram-gemma4-vision — Implementation Plan
 
 ## Estado: Phase 1 ✅ Completada
 
@@ -24,7 +24,7 @@
 
 ### Documentación + Repo
 - [x] README.md completo
-- [x] GitHub repo: hbuddenberg/nuc-gemma4-vision
+- [x] GitHub repo: hbuddenberg/lowram-gemma4-vision
 - [x] PRD.md
 - [x] TRD.md
 - [x] Este documento (IMPLEMENTATION.md)

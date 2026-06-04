@@ -1,4 +1,4 @@
-# nuc-gemma4-vision — Technical Requirements Document
+# lowram-gemma4-vision — Technical Requirements Document
 
 ## 1. Architecture Diagram
 
@@ -193,7 +193,7 @@ print(model.model.embed_vision.embedding_projection.weight.dtype)
 ## 7. Directory Structure
 
 ```
-nuc-gemma4-vision/
+lowram-gemma4-vision/
 ├── README.md                    # Setup guide + architecture overview
 ├── LICENSE                      # MIT
 ├── requirements.txt             # Python dependencies

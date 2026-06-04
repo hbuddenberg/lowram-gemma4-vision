@@ -1,38 +1,57 @@
-# NUC Gemma 4 Vision
+# LowRAM Gemma 4 Vision
 
-Intel NUC7i5BNB → Thunderbolt 3 → RTX 3060 12GB → Gemma 4 E4B multimodal inference with vision.
+Run Gemma 4 E4B multimodal inference (text + vision) on consumer hardware with limited RAM. Text at ~4 tok/s, vision at ~7 tok/s on a single RTX 3060 12GB via Thunderbolt 3 eGPU.
 
-## Hardware
+**Key innovation**: 4-bit NF4 quantization for the language model backbone while keeping the vision pipeline (tower + projector) in full bfloat16 — fitting a 15GB model into 9.3GB VRAM.
 
-| Component | Detail |
-|-----------|--------|
-| Host | Intel NUC7i5BNB (i5-7260U, 7.6GB RAM) |
-| eGPU enclosure | Razer Core X Chroma (×2) |
-| GPU | NVIDIA RTX 3060 12GB (GA104) |
-| Connection | Thunderbolt 3 via Alpine Ridge 2C+4C, 40 Gb/s |
-| OS | Arch Linux, kernel 7.0.10-zen1-1-zen |
+## The Problem
+
+Gemma 4 E4B is a 15GB multimodal model (text + vision + audio). Running it requires:
+- 15GB+ VRAM for unquantized inference, OR
+- Clever quantization that preserves vision capabilities
+
+Standard 4-bit quantization breaks vision because the vision-to-language projector (`embed_vision`) gets quantized too, destroying all visual information. This project documents the fix and provides a ready-to-use inference script.
+
+## The Fix
+
+The `embed_vision` module must be excluded from bitsandbytes quantization. Without this, the model describes every image as "a solid gray background":
+
+```python
+BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+    llm_int8_skip_modules=[
+        "vision_tower", "model.vision_tower",
+        "embed_vision", "model.embed_vision",    # ← CRITICAL
+        "audio_tower", "model.audio_tower",
+        "embed_audio", "model.embed_audio",
+        "lm_head",
+    ],
+)
+```
+
+**Why both names?** `llm_int8_skip_modules` does fuzzy matching, but the full module path (`model.embed_vision`) is needed for nested modules in Gemma4's architecture. Without it, `embed_vision.embedding_projection.weight` gets quantized to `uint8` and vision becomes blind.
 
 ## Setup
 
-### 1. Thunderbolt 3 (BIOS)
+### 1. System Requirements
 
-Set Thunderbolt Security Level to **Legacy Mode** in BIOS (BNKBL357.86A.0088). Unique ID mode does NOT work with Alpine Ridge on Linux. Requires cold boot after BIOS change.
-
-```bash
-# Verify TB3 appears
-lspci -nn | grep -i thunderbolt
-# Should show: Alpine Ridge 2C [8086:15da] and Alpine Ridge 4C [8086:15d3]
-
-# Verify GPU appears
-lspci -nn | grep -i nvidia
-# Should show: NVIDIA RTX 3060 [10de:2504]
-```
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | NVIDIA RTX 3060 12GB | RTX 4060 16GB |
+| System RAM | 4GB (with overcommit) | 16GB+ |
+| Storage | 30GB free | NVMe SSD |
+| Connection | PCIe or Thunderbolt 3+ | Direct PCIe |
 
 ### 2. NVIDIA Driver
 
 ```bash
-sudo pacman -S nvidia-open-dkms nvidia-utils nvidia-settings linux-zen-headers
-sudo dkms install nvidia/610.43.02 -k 7.0.10-zen1-1-zen
+# Arch Linux (kernel zen)
+sudo pacman -S nvidia-open-dkms nvidia-utils linux-zen-headers
+
+# Other distros: use standard nvidia driver >= 550
 ```
 
 Blacklist nouveau:
@@ -42,114 +61,121 @@ blacklist nouveau
 options nouveau modeset=0
 ```
 
-Reboot, then verify:
-```bash
-nvidia-smi
-# Should show RTX 3060, 12GB VRAM
-```
+### 3. Memory Config (Low-RAM Hosts)
 
-### 3. System Config
+If your system RAM is less than the model file size (15GB), enable overcommit:
 
-Allow mmap for large safetensors (7.6GB RAM host needs overcommit):
 ```bash
 sudo sysctl vm.overcommit_memory=1
-# Persist: echo "vm.overcommit_memory=1" | sudo tee -a /etc/sysctl.d/99-overcommit.conf
+# Persist:
+echo "vm.overcommit_memory=1" | sudo tee -a /etc/sysctl.d/99-overcommit.conf
 ```
 
-### 4. Python Dependencies
+This allows mmap to virtually map the 15GB safetensors file even with only 4GB RAM. The actual memory pressure stays low because bitsandbytes quantizes on load.
+
+### 4. Thunderbolt 3 eGPU (If Using External GPU)
+
+Set Thunderbolt Security Level to **Legacy Mode** in BIOS. Cold boot after changing. Verify:
+
+```bash
+lspci -nn | grep -i -E "thunderbolt|nvidia"
+nvidia-smi
+```
+
+### 5. Python Dependencies
 
 ```bash
 # Using uv (recommended)
-uv pip install transformers accelerate bitsandbytes torchvision Pillow torch
+uv pip install transformers>=5.10 accelerate>=1.13 bitsandbytes>=0.49 \
+               torch torchvision Pillow
+
+# Or pip
+pip install transformers accelerate bitsandbytes torch torchvision Pillow
 ```
 
-### 5. Download Model
+### 6. Download Model
 
 ```bash
-# From HuggingFace (15GB)
-wget -c "https://huggingface.co/igorls/gemma-4-E4B-it-heretic/resolve/main/model.safetensors" \
-  -O ~/models/gemma4-heretic/model.safetensors
+mkdir -p ~/models/gemma4-heretic && cd ~/models/gemma4-heretic
 
-# Also need: config.json, tokenizer.json, preprocessor_config.json, processor_config.json,
-# generation_config.json, tokenizer_config.json, chat_template.jinja
-# Either wget each file or use:
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download('igorls/gemma-4-E4B-it-heretic', local_dir='~/models/gemma4-heretic', allow_patterns=['*.json','*.jinja'])"
+# Large file — use wget with resume support
+wget -c "https://huggingface.co/igorls/gemma-4-E4B-it-heretic/resolve/main/model.safetensors"
+
+# Config files (small)
+for f in config.json tokenizer.json tokenizer_config.json preprocessor_config.json \
+         processor_config.json generation_config.json chat_template.jinja; do
+  wget -c "https://huggingface.co/igorls/gemma-4-E4B-it-heretic/resolve/main/$f"
+done
 ```
 
-### 6. Run Inference
+### 7. Run
 
 ```bash
-python3 inference.py
-# Text: ~4.2 tok/s
-# Vision: ~5.6-7.5 tok/s
-# VRAM: 9.3GB / 11.6GB
+python inference.py                                    # Text + sample image
+python inference.py path/to/your/image.jpg             # Text + your image
+GEMMA4_MODEL_PATH=~/models/gemma4-heretic python inference.py  # Custom model path
 ```
 
-## Key Finding: embed_vision Must Skip Quantization
+## Performance
 
-**Critical bug fix**: The `embed_vision` module (Gemma4MultimodalEmbedder) maps vision embeddings to the language model's embedding space. If bitsandbytes quantizes it to 4-bit (uint8), all image information is destroyed — the model sees a uniform gray image regardless of input.
+| Metric | Value |
+|--------|-------|
+| Text generation | ~4.2 tok/s |
+| Vision analysis | ~5.6-7.5 tok/s |
+| VRAM usage | 9.3GB / 11.6GB (RTX 3060 12GB) |
+| Model load time | ~90 seconds |
+| First token latency | ~5 seconds (vision) |
 
-The `llm_int8_skip_modules` must include the **full module path** for the skip to work:
-
-```python
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-    llm_int8_skip_modules=[
-        "vision_tower", "model.vision_tower",
-        "multi_modal_projector",
-        "embed_vision", "model.embed_vision",
-        "audio_tower", "model.audio_tower",
-        "embed_audio", "model.embed_audio",
-        "lm_head",
-    ],
-)
-```
-
-### Why This Happens
-
-- Gemma4's architecture uses `model.embed_vision` (Gemma4MultimodalEmbedder), NOT `multi_modal_projector`
-- `llm_int8_skip_modules` does fuzzy matching but the full path is needed for nested modules
-- Without the skip, `embed_vision.embedding_projection.weight` gets quantized to uint8, producing garbage embeddings
-- The vision tower itself (bfloat16) works fine — the corruption happens at the projection step
-
-### Symptoms
-
-- Text inference works perfectly (4+ tok/s)
-- Vision inference runs but always describes "a solid gray image"
-- `pixel_values` are correct (min=0, max=0.98, 7.1% zeros)
-- Vision tower output is correct (varied activations)
-- `embed_vision` parameters show `torch.uint8` instead of `torch.bfloat16`
+Tested on: Intel i5-7260U (7.6GB RAM) + RTX 3060 12GB via Thunderbolt 3.
 
 ## Architecture
 
 ```
 Gemma4ForConditionalGeneration
 ├── model (Gemma4Model)
-│   ├── vision_tower (Gemma4VisionModel) — 16 layers, hidden=768, fp16
-│   ├── language_model — 42 layers, hidden=2560, 4-bit NF4
-│   ├── audio_tower (Gemma4AudioModel) — skipped
-│   ├── embed_vision (Gemma4MultimodalEmbedder) — projection 768→2560, fp16
-│   └── embed_audio — skipped
-└── lm_head — Linear(2560, 262144), fp16
+│   ├── vision_tower (Gemma4VisionModel)     — 16 layers, 768d, fp16
+│   ├── language_model                        — 42 layers, 2560d, NF4 4-bit
+│   ├── embed_vision (Gemma4MultimodalEmbedder) — 768→2560 projection, fp16
+│   └── audio_tower                           — skipped (not used)
+└── lm_head (Linear 2560→262144)             — fp16
 ```
 
-VRAM breakdown:
-- Language model 4-bit: ~3.5GB
-- Vision tower fp16: ~0.5GB
-- embed_vision + lm_head fp16: ~0.8GB
-- KV cache + overhead: ~4.5GB
-- **Total: ~9.3GB / 11.6GB**
+## Troubleshooting
 
-## Files
+### Vision sees "solid gray"
+→ `embed_vision` is being quantized. Verify:
+```python
+print(model.model.embed_vision.embedding_projection.weight.dtype)
+# Must be torch.bfloat16, NOT torch.uint8
+```
 
-- `inference.py` — Main inference script (text + vision)
-- `config.json` — Model config (reference, downloaded from HF)
-- `requirements.txt` — Python dependencies
+### OOM when loading model
+→ Enable overcommit: `sudo sysctl vm.overcommit_memory=1`
+
+### nouveau conflicts with nvidia
+→ Ensure blacklist is active: `lsmod | grep nouveau` should return nothing.
+
+### Thunderbolt not detecting GPU
+→ BIOS: set Thunderbolt Security Level to Legacy Mode. Cold boot (full power off).
+
+## Project Structure
+
+```
+lowram-gemma4-vision/
+├── README.md
+├── LICENSE (MIT)
+├── requirements.txt
+├── inference.py                 # Main script
+├── .env.example
+├── .gitignore
+├── docs/PLANNING/
+│   ├── PRD.md                  # Product requirements
+│   ├── TRD.md                  # Technical architecture
+│   └── IMPLEMENTATION.md       # Phased plan
+├── scripts/                     # Future: setup.sh
+└── examples/                    # Future: usage examples
+```
 
 ## License
 
-Setup scripts and documentation: MIT
-Model: See [igorls/gemma-4-E4B-it-heretic](https://huggingface.co/igorls/gemma-4-E4B-it-heretic) for model license.
+MIT for code and documentation. The Gemma 4 model is subject to [Google's license](https://huggingface.co/igorls/gemma-4-E4B-it-heretic).
