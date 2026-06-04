@@ -132,11 +132,37 @@ Run Gemma 4 as a local OpenAI-compatible API — use it from any tool that suppo
 
 ### Endpoints
 
+#### Inference
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/v1/chat/completions` | POST | API Key | OpenAI-compatible chat (streaming + non-streaming) |
+| `/v1/models` | GET | API Key | List available models |
+| `/v1/models/{model}` | GET | API Key | Model details |
+| `/health` | GET | None | Health check + VRAM + uptime |
+
+#### Admin (requires `GEMMA4_MASTER_KEY`)
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/chat/completions` | POST | OpenAI-compatible chat (streaming + non-streaming) |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check + VRAM status |
+| `POST /v1/keys` | POST | Create API key |
+| `GET /v1/keys` | GET | List all keys |
+| `GET /v1/keys/{prefix}/usage` | GET | Per-key usage stats |
+| `POST /v1/keys/{prefix}/rotate` | POST | Regenerate secret |
+| `DELETE /v1/keys/{prefix}` | DELETE | Delete key |
+| `GET /v1/usage` | GET | Global analytics |
+| `GET /v1/config` | GET | Server configuration |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMMA4_API_KEY` | `gemma4-local` | Legacy single-key auth |
+| `GEMMA4_MASTER_KEY` | (none) | Admin key for management |
+| `GEMMA4_ADMIN_KEY` | (none) | Alias for master key |
+| `GEMMA4_MODEL_PATH` | `~/models/gemma4-heretic` | Model directory |
+| `GEMMA4_MAX_IMAGE_MB` | `20` | Max vision image size |
+| `GEMMA4_CORS_ORIGINS` | `*` | CORS allowed origins |
 
 ### Usage Examples
 
@@ -205,7 +231,12 @@ custom_providers:
     model: gemma-4-e4b-heretic
 ```
 
-Then switch to it: `hermes model` → select `gemma4-local`.
+Then set as default:
+
+```bash
+hermes config set model.default gemma-4-e4b-heretic
+hermes config set model.provider custom:gemma4-local
+```
 
 ### Systemd Service (auto-start)
 
@@ -268,10 +299,11 @@ print(model.model.embed_vision.embedding_projection.weight.dtype)
 ```
 lowram-gemma4-vision/
 ├── README.md
+├── SDD.md                        # Software Design Document (v2.1.0)
 ├── LICENSE (MIT)
 ├── requirements.txt
 ├── inference.py                 # Standalone text + vision script
-├── server.py                    # OpenAI-compatible API server (FastAPI)
+├── server.py                    # OpenAI-compatible API server (FastAPI + SQLite)
 ├── start.sh                     # Quick start script
 ├── gemma4-api.service           # systemd user service
 ├── .env.example
