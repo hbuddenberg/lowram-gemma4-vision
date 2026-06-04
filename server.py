@@ -430,7 +430,11 @@ class StopSequenceCriteria(StoppingCriteria):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str | list = ""
+    content: str | list | None = ""
+    # Tool calling fields (OpenAI-compatible, all optional)
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
     @field_validator("role")
     @classmethod
@@ -637,8 +641,10 @@ def unload_model() -> None:
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
 
-def _parse_content(content: str | list) -> tuple[str, list[Image.Image]]:
+def _parse_content(content: str | list | None) -> tuple[str, list[Image.Image]]:
     """Extract text and images from OpenAI-format message content."""
+    if content is None:
+        return "", []
     if isinstance(content, str):
         return content, []
 
@@ -681,17 +687,61 @@ def _parse_content(content: str | list) -> tuple[str, list[Image.Image]]:
 
 
 def _build_messages(messages: list[ChatMessage]) -> list[dict]:
-    """Convert ChatMessage list to processor-expected format."""
+    """Convert OpenAI ChatMessage list to the format expected by the Gemma 4 chat template.
+
+    The Gemma 4 chat_template.jinja expects:
+    - Assistant messages with `tool_calls`: [{function: {name, arguments (dict|str)}}]
+    - Tool result messages with `tool_responses`: [{name, response}]
+      or alternatively, `tool` role messages are accepted by apply_chat_template
+
+    OpenAI clients send:
+    - Assistant messages with `tool_calls`: [{id, type, function: {name, arguments (str)}}]
+    - Tool messages with `role: "tool"`, `tool_call_id`, `name`, `content`
+    """
     result = []
     for msg in messages:
         text, images = _parse_content(msg.content)
+        entry: dict = {"role": msg.role}
+
+        # Handle images in content
         if images:
             content_list: list[dict] = [{"type": "image"}]
             if text:
                 content_list.append({"type": "text", "text": text})
-            result.append({"role": msg.role, "content": content_list})
-        else:
-            result.append({"role": msg.role, "content": text})
+            entry["content"] = content_list
+        elif text:
+            entry["content"] = text
+
+        # ── Assistant messages with tool_calls ────────────────────────
+        # OpenAI: {"role": "assistant", "tool_calls": [{id, type, function: {name, arguments: str}}]}
+        # Gemma:  {"role": "assistant", "tool_calls": [{function: {name, arguments: dict|str}}]}
+        # parse_response returns arguments as dict → our OpenAI output serializes to JSON str.
+        # The chat template accepts BOTH dict and string arguments (lines 193-201).
+        if msg.role == "assistant" and msg.tool_calls:
+            gemma_tool_calls = []
+            for tc in msg.tool_calls:
+                func = tc.get("function", {})
+                # Arguments from OpenAI client are a JSON string — try to parse to dict
+                # so the chat template can use its own formatting (line 198)
+                args = func.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Keep as string, template handles both
+                gemma_tool_calls.append({
+                    "function": {"name": func.get("name", ""), "arguments": args}
+                })
+            entry["tool_calls"] = gemma_tool_calls
+
+        # ── Tool result messages ──────────────────────────────────────
+        # OpenAI: {"role": "tool", "tool_call_id": "call_abc", "content": "...", "name": "fn"}
+        # Convert to a standard dict the chat template can process.
+        if msg.role == "tool":
+            result.append(entry)
+            continue
+
+        result.append(entry)
     return result
 
 
@@ -779,8 +829,8 @@ def generate_sync(
     # Extract parsed fields
     reasoning_content = parsed.get("thinking")
     response_text = parsed.get("content") or ""
-    # Strip any remaining special tokens from content
-    for marker in ["<eos>", "<pad>", "<bos>"]:
+    # Strip remaining model artifacts
+    for marker in ["<eos>", "<pad>", "<bos>", "<turn|>"]:
         response_text = response_text.replace(marker, "").strip()
 
     # Convert parsed tool_calls to OpenAI format
@@ -1119,13 +1169,14 @@ async def _stream_generator(
 
             accumulated = ""
             in_thinking = False
+            in_tool = False
             asyncio.run_coroutine_threadsafe(queue.put(("role", input_len)), loop)
 
             for chunk in streamer:
                 if chunk:
                     accumulated += chunk
 
-                    # Detect thinking blocks — stream thinking tokens to client
+                    # ── Thinking blocks: stream thinking tokens to client ──
                     if "<|think|>" in chunk:
                         in_thinking = True
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking_start",)), loop)
@@ -1134,10 +1185,20 @@ async def _stream_generator(
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking_end",)), loop)
                     elif in_thinking:
                         asyncio.run_coroutine_threadsafe(queue.put(("thinking", chunk)), loop)
+
+                    # ── Tool call blocks: suppress from content stream ──
+                    elif "<|tool_call>" in chunk:
+                        in_tool = True
+                    elif "<tool_call|>" in chunk:
+                        in_tool = False
+                    elif in_tool:
+                        pass  # Suppress tool call tokens from content stream
+
+                    # ── Content: only stream clean text ──
                     elif not in_thinking:
-                        # Content chunk — stream to client
-                        # (tool call markers pass through as content; parse_response cleans them up at the end)
-                        asyncio.run_coroutine_threadsafe(queue.put(("content", chunk)), loop)
+                        # Skip <|turn|> markers (model EOS token)
+                        if "<turn|>" not in chunk:
+                            asyncio.run_coroutine_threadsafe(queue.put(("content", chunk)), loop)
 
             thread.join()
 
