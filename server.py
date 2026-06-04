@@ -7,6 +7,8 @@ Endpoints:
   POST /v1/chat/completions  — OpenAI-compatible (streaming + non-streaming)
   GET  /v1/models            — List available models
   GET  /health               — Health check + VRAM
+  POST /v1/keys              — Generate/list/revoke API keys (master-key protected)
+  GET  /v1/config            — Server config (master-key protected)
 
 Usage:
   python server.py [--host 0.0.0.0] [--port 8080] [--model-path ~/models/gemma4-heretic]
@@ -16,15 +18,19 @@ import argparse
 import asyncio
 import base64
 import gc
+import hashlib
 import ipaddress
 import io
 import json
 import logging
 import os
+import secrets
+import signal
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
@@ -33,6 +39,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image
 from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
@@ -62,17 +69,122 @@ MODEL_OBJ: Optional[Gemma4ForConditionalGeneration] = None
 PROCESSOR: Optional[Gemma4Processor] = None
 LOAD_LOCK = threading.Lock()
 INFERENCE_SEMAPHORE: Optional[asyncio.Semaphore] = None
+SERVER_START_TIME = time.time()
 
 # ── Configurable defaults ────────────────────────────────────────────────────
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.9
 API_KEY = os.environ.get("GEMMA4_API_KEY", "gemma4-local")
+MASTER_KEY = os.environ.get("GEMMA4_MASTER_KEY", "")
 MAX_IMAGE_SIZE_MB = int(os.environ.get("GEMMA4_MAX_IMAGE_MB", "20"))
 VALID_ROLES = {"system", "user", "assistant", "tool"}
+DEFAULT_RATE_LIMIT = 10  # requests per minute per key
+
+# ── Storage paths ────────────────────────────────────────────────────────────
+CONFIG_DIR = Path.home() / ".config" / "gemma4-api"
+KEYS_FILE = CONFIG_DIR / "keys.json"
+USAGE_LOG = CONFIG_DIR / "usage.jsonl"
 
 # ── Security: allowed image hosts (empty = allow all public) ─────────────────
 ALLOWED_IMAGE_DIR = os.environ.get("GEMMA4_IMAGE_DIR", "")
+
+
+# ── API Key Management ──────────────────────────────────────────────────────
+
+
+def _init_config_dir():
+    """Ensure config directory exists."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_keys() -> dict:
+    """Load API keys from storage."""
+    if not KEYS_FILE.exists():
+        return {}
+    try:
+        with open(KEYS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_keys(keys: dict):
+    """Save API keys to storage."""
+    _init_config_dir()
+    with open(KEYS_FILE, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
+        json.dump(keys, f, indent=2)
+
+
+def _hash_key(key: str) -> str:
+    """Hash an API key for storage."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _validate_key(key: str) -> Optional[str]:
+    """Validate API key, return key_prefix if valid."""
+    if not key:
+        return None
+
+    # Allow legacy key (no key management)
+    if key == API_KEY:
+        return "legacy"
+
+    # Check against stored keys
+    keys = _load_keys()
+    key_hash = _hash_key(key)
+
+    for prefix, data in keys.items():
+        if data.get("key_hash") == key_hash and data.get("enabled"):
+            return prefix
+
+    return None
+
+
+class RateLimiter:
+    """Per-key sliding window rate limiter."""
+
+    def __init__(self):
+        self.requests: dict[str, list[float]] = {}
+
+    def is_allowed(self, key_prefix: str, limit: int = DEFAULT_RATE_LIMIT) -> bool:
+        """Check if request is allowed under rate limit (requests per minute)."""
+        now = time.time()
+        window_start = now - 60  # 1 minute window
+
+        if key_prefix not in self.requests:
+            self.requests[key_prefix] = []
+
+        # Remove old requests outside window
+        self.requests[key_prefix] = [t for t in self.requests[key_prefix] if t > window_start]
+
+        # Check limit
+        if len(self.requests[key_prefix]) >= limit:
+            return False
+
+        # Record request
+        self.requests[key_prefix].append(now)
+        return True
+
+
+RATE_LIMITER = RateLimiter()
+
+
+def _log_usage(key_prefix: str, model: str, prompt_tokens: int,
+               completion_tokens: int, latency_ms: float):
+    """Log request usage to JSONL file."""
+    _init_config_dir()
+    usage = {
+        "timestamp": time.time(),
+        "key_prefix": key_prefix,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "latency_ms": latency_ms,
+    }
+    with open(USAGE_LOG, "a") as f:
+        f.write(json.dumps(usage) + "\n")
 
 
 # ── Stopping criteria for stop sequences ─────────────────────────────────────
@@ -84,11 +196,16 @@ class StopSequenceCriteria(StoppingCriteria):
     def __init__(self, tokenizer, stop_sequences: list[str]):
         self.tokenizer = tokenizer
         self.stop_sequences = stop_sequences
-        self._decoded = ""
+        self._last_len = 0
+        self._accumulated = ""
 
     def __call__(self, input_ids, scores, **kwargs):
-        new_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        return any(seq in new_text for seq in self.stop_sequences)
+        current_len = input_ids.shape[1]
+        if current_len > self._last_len:
+            new_tokens = self.tokenizer.decode(input_ids[0, self._last_len:], skip_special_tokens=False)
+            self._accumulated += new_tokens
+            self._last_len = current_len
+        return any(seq in self._accumulated for seq in self.stop_sequences)
 
 
 # ── Pydantic models (OpenAI-compatible) ──────────────────────────────────────
@@ -144,6 +261,44 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage
 
 
+# ── API Key Management Models ────────────────────────────────────────────────
+
+
+class CreateKeyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    rate_limit: int = Field(default=DEFAULT_RATE_LIMIT, ge=1, le=1000)
+
+
+class KeyResponse(BaseModel):
+    key_prefix: str
+    key: Optional[str] = None  # Only returned on creation
+    name: str
+    created_at: str
+    rate_limit: int
+    enabled: bool
+
+
+class ConfigResponse(BaseModel):
+    model: str
+    version: str
+    vram_used_gb: float
+    vram_total_gb: float
+    active_keys: int
+    uptime_seconds: float
+
+
+# ── Error Response Helper ────────────────────────────────────────────────────
+
+
+def _error_response(message: str, error_type: str = "invalid_request_error",
+                   code: Optional[str] = None) -> dict:
+    """Format error response in OpenAI style."""
+    error_dict = {"message": message, "type": error_type}
+    if code:
+        error_dict["code"] = code
+    return {"error": error_dict}
+
+
 # ── Security helpers ─────────────────────────────────────────────────────────
 
 
@@ -174,21 +329,37 @@ def _validate_image_path(path: str) -> bool:
         return False  # No file path loading without explicit config
     real = os.path.realpath(path)
     allowed = os.path.realpath(ALLOWED_IMAGE_DIR)
-    return real.startswith(allowed) and os.path.isfile(real)
+    return (real.startswith(allowed + os.sep) or real == allowed) and os.path.isfile(real)
 
 
-def _check_api_key(request: Request):
-    """Validate API key from Authorization header."""
+def _check_api_key(request: Request) -> Optional[str]:
+    """Validate API key from Authorization header, return key_prefix if valid."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        token = auth[7:]
-        if token == API_KEY:
-            return True
+        key = auth[7:]
+        prefix = _validate_key(key)
+        if prefix:
+            return prefix
+
     # Also check X-API-Key header
     api_key = request.headers.get("X-API-Key", "")
-    if api_key == API_KEY:
-        return True
-    return False
+    if api_key:
+        prefix = _validate_key(api_key)
+        if prefix:
+            return prefix
+
+    return None
+
+
+def _check_master_key(request: Request) -> bool:
+    """Validate master key for admin endpoints."""
+    if not MASTER_KEY:
+        return False
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:] == MASTER_KEY
+    api_key = request.headers.get("X-API-Key", "")
+    return api_key == MASTER_KEY
 
 
 # ── Model loading ────────────────────────────────────────────────────────────
@@ -287,7 +458,7 @@ def _parse_content(content: str | list) -> tuple[str, list[Image.Image]]:
                 elif url.startswith("http"):
                     if _is_private_url(url):
                         raise ValueError("Fetching internal/private URLs is blocked")
-                    resp = _requests.get(url, timeout=15, stream=True)
+                    resp = _requests.get(url, timeout=15, stream=True, allow_redirects=False)
                     resp.raise_for_status()
                     size = 0
                     chunks = []
@@ -407,20 +578,30 @@ def generate_sync(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, cleanup on shutdown."""
-    global INFERENCE_SEMAPHORE
+    global INFERENCE_SEMAPHORE, SERVER_START_TIME
+    SERVER_START_TIME = time.time()
     INFERENCE_SEMAPHORE = asyncio.Semaphore(1)
+
+    # Warn if MASTER_KEY is not set
+    if not MASTER_KEY:
+        log.warning("GEMMA4_MASTER_KEY not set: /v1/keys and /v1/config endpoints are publicly accessible")
 
     loop = asyncio.get_event_loop()
     log.info("Pre-loading model...")
     await loop.run_in_executor(None, load_model, MODEL_PATH)
     log.info("Server ready!")
 
-    yield  # Server runs here
+    # Handle graceful shutdown on SIGTERM
+    def _on_sigterm():
+        log.info("SIGTERM received, starting graceful shutdown...")
 
-    # Shutdown: cleanup GPU
-    log.info("Shutting down...")
-    await loop.run_in_executor(None, unload_model)
-    log.info("Cleanup complete.")
+    try:
+        yield  # Server runs here
+    finally:
+        # Shutdown: cleanup GPU
+        log.info("Shutting down...")
+        await loop.run_in_executor(None, unload_model)
+        log.info("Cleanup complete.")
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
@@ -443,12 +624,16 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def add_request_id(request: Request, call_next):
+    """Add X-Request-ID to all responses."""
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    request.state.request_id = request_id
     start = time.time()
     response = await call_next(request)
     duration = time.time() - start
+    response.headers["X-Request-ID"] = request_id
     log.info(
-        f"{request.method} {request.url.path} "
+        f"[{request_id}] {request.method} {request.url.path} "
         f"{response.status_code} {duration:.2f}s"
     )
     return response
@@ -477,7 +662,6 @@ async def health():
         "status": "ok" if loaded else "loading",
         "model_loaded": loaded,
         "vram": vram,
-        "semaphore_available": INFERENCE_SEMAPHORE._value if INFERENCE_SEMAPHORE else 0,
     }
 
 
@@ -500,30 +684,54 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     # Auth check
-    if not _check_api_key(raw_request):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    key_prefix = _check_api_key(raw_request)
+    if not key_prefix:
+        return JSONResponse(
+            status_code=401,
+            content=_error_response("Invalid or missing API key", "authentication_error")
+        )
 
-    req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    req_id = raw_request.state.request_id
     created = int(time.time())
+    req_start = time.time()
+
     log.info(f"[{req_id}] request: {len(req.messages)} msgs, stream={req.stream}, "
              f"max_tokens={req.max_tokens}")
 
+    # Rate limiting check
+    keys = _load_keys()
+    key_data = keys.get(key_prefix, {})
+    rate_limit = key_data.get("rate_limit", DEFAULT_RATE_LIMIT)
+
+    if not RATE_LIMITER.is_allowed(key_prefix, rate_limit):
+        log.warning(f"[{req_id}] rate limit exceeded for {key_prefix}")
+        return JSONResponse(
+            status_code=429,
+            content=_error_response(
+                f"Rate limit exceeded: {rate_limit} requests per minute",
+                "rate_limit_error"
+            )
+        )
+
     # Acquire semaphore — serialize GPU access (prevent OOM)
     if INFERENCE_SEMAPHORE is None:
-        raise HTTPException(503, "Server not ready")
+        return JSONResponse(
+            status_code=503,
+            content=_error_response("Server not ready", "server_error")
+        )
 
-    if not INFERENCE_SEMAPHORE.locked() and INFERENCE_SEMAPHORE._value <= 0:
-        raise HTTPException(503, "Server busy — another request is being processed")
+    if req.stream:
+        # For streaming, manually acquire semaphore before returning generator.
+        # Release happens in generator's finally block after streaming completes.
+        await INFERENCE_SEMAPHORE.acquire()
+        return EventSourceResponse(
+            _stream_generator(req, req_id, created, key_prefix, req_start, INFERENCE_SEMAPHORE),
+            media_type="text/event-stream",
+        )
 
+    # Non-streaming: use async with for automatic release
     async with INFERENCE_SEMAPHORE:
         try:
-            if req.stream:
-                return EventSourceResponse(
-                    _stream_generator(req, req_id, created),
-                    media_type="text/event-stream",
-                )
-
-            # Non-streaming
             loop = asyncio.get_event_loop()
             response_text, prompt_tokens, completion_tokens = await loop.run_in_executor(
                 None,
@@ -535,8 +743,12 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                 req.stop,
             )
 
+            latency_ms = (time.time() - req_start) * 1000
+            _log_usage(key_prefix, req.model, prompt_tokens, completion_tokens, latency_ms)
+
             log.info(
-                f"[{req_id}] completed: {prompt_tokens}+{completion_tokens} tokens"
+                f"[{req_id}] completed: {prompt_tokens}+{completion_tokens} tokens, "
+                f"{latency_ms:.0f}ms"
             )
 
             return ChatCompletionResponse(
@@ -560,17 +772,27 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             torch.cuda.empty_cache()
             gc.collect()
             log.error(f"[{req_id}] CUDA OOM!")
-            raise HTTPException(503, "GPU out of memory — request too large")
+            return JSONResponse(
+                status_code=503,
+                content=_error_response("GPU out of memory — request too large", "server_error")
+            )
         except ValueError as e:
             log.warning(f"[{req_id}] validation error: {e}")
-            raise HTTPException(400, str(e))
+            return JSONResponse(
+                status_code=400,
+                content=_error_response(str(e), "invalid_request_error")
+            )
         except Exception as e:
             log.exception(f"[{req_id}] inference failed")
-            raise HTTPException(500, f"Generation failed: {e}")
+            return JSONResponse(
+                status_code=500,
+                content=_error_response(f"Generation failed: {str(e)}", "server_error")
+            )
 
 
 async def _stream_generator(
-    req: ChatCompletionRequest, req_id: str, created: int
+    req: ChatCompletionRequest, req_id: str, created: int,
+    key_prefix: str, req_start: float, semaphore: asyncio.Semaphore
 ) -> AsyncIterator[dict]:
     """Real streaming via asyncio.Queue bridge from thread to async SSE."""
     loop = asyncio.get_running_loop()
@@ -607,7 +829,7 @@ async def _stream_generator(
             thread.start()
 
             prompt_tokens = input_len
-            completion_tokens = 0
+            accumulated_text = ""
 
             # First chunk: send role
             asyncio.run_coroutine_threadsafe(
@@ -616,18 +838,17 @@ async def _stream_generator(
 
             for text_chunk in streamer:
                 if text_chunk:
-                    completion_tokens += 1
+                    accumulated_text += text_chunk
                     asyncio.run_coroutine_threadsafe(
-                        queue.put(("content", text_chunk, completion_tokens)), loop
+                        queue.put(("content", text_chunk)), loop
                     )
 
-                    # Check stop sequences in streaming
-                    if req.stop:
-                        # We need accumulated text for stop check
-                        # StoppingCriteria handles it at generate level
-                        pass
-
             thread.join()
+
+            # Count actual tokens from accumulated text
+            completion_tokens = len(
+                processor.tokenizer.encode(accumulated_text, add_special_tokens=False)
+            )
 
             # Signal completion
             asyncio.run_coroutine_threadsafe(
@@ -638,101 +859,251 @@ async def _stream_generator(
             error_holder[0] = e
             asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
 
-    # Start inference in thread pool
-    await loop.run_in_executor(None, _run_inference)
+    # Start inference in background (don't await)
+    loop.run_in_executor(None, _run_inference)
 
     # Consume queue and yield SSE events
     total_prompt = 0
     total_completion = 0
 
-    while True:
-        item = await queue.get()
-        tag = item[0]
+    try:
+        while True:
+            item = await queue.get()
+            tag = item[0]
 
-        if tag == "role":
-            total_prompt = item[1]
-            # First delta: include role
-            data = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield {"event": "message", "data": json.dumps(data)}
+            if tag == "role":
+                total_prompt = item[1]
+                # First delta: include role
+                data = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield {"event": "message", "data": json.dumps(data)}
 
-        elif tag == "content":
-            text_chunk = item[1]
-            total_completion = item[2]
-            data = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": text_chunk},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield {"event": "message", "data": json.dumps(data)}
+            elif tag == "content":
+                text_chunk = item[1]
+                data = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": text_chunk},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield {"event": "message", "data": json.dumps(data)}
 
-        elif tag == "done":
-            total_prompt = item[1]
-            total_completion = item[2]
-            # Final chunk with finish_reason + usage
-            final = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": total_prompt,
-                    "completion_tokens": total_completion,
-                    "total_tokens": total_prompt + total_completion,
-                },
-            }
-            yield {"event": "message", "data": json.dumps(final)}
-            # OpenAI [DONE] sentinel
-            yield {"event": "message", "data": "[DONE]"}
-            log.info(
-                f"[{req_id}] stream completed: "
-                f"{total_prompt}+{total_completion} tokens"
+            elif tag == "done":
+                total_prompt = item[1]
+                total_completion = item[2]
+
+                # Log usage
+                latency_ms = (time.time() - req_start) * 1000
+                _log_usage(key_prefix, req.model, total_prompt, total_completion, latency_ms)
+
+                # Final chunk with finish_reason + usage
+                final = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": total_prompt,
+                        "completion_tokens": total_completion,
+                        "total_tokens": total_prompt + total_completion,
+                    },
+                }
+                yield {"event": "message", "data": json.dumps(final)}
+                # OpenAI [DONE] sentinel
+                yield {"event": "message", "data": "[DONE]"}
+                log.info(
+                    f"[{req_id}] stream completed: "
+                    f"{total_prompt}+{total_completion} tokens, {latency_ms:.0f}ms"
+                )
+                break
+
+            elif tag == "error":
+                error_data = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": f"\n[Error: {item[1]}]"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield {"event": "message", "data": json.dumps(error_data)}
+                yield {"event": "message", "data": "[DONE]"}
+                break
+    finally:
+        semaphore.release()
+
+
+@app.post("/v1/keys")
+async def manage_keys(raw_request: Request):
+    """Create/list/revoke API keys (master-key protected)."""
+    if not _check_master_key(raw_request):
+        return JSONResponse(
+            status_code=401,
+            content=_error_response("Invalid or missing master key", "authentication_error")
+        )
+
+    req_id = raw_request.state.request_id
+    method = raw_request.method
+
+    try:
+        body = await raw_request.json() if raw_request.method in ["POST", "PUT"] else {}
+    except Exception:
+        body = {}
+
+    if method == "POST":
+        # Create new key
+        if "name" not in body:
+            return JSONResponse(
+                status_code=400,
+                content=_error_response("Missing 'name' field", "invalid_request_error")
             )
-            break
 
-        elif tag == "error":
-            error_data = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": f"\n[Error: {item[1]}]"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-            yield {"event": "message", "data": json.dumps(error_data)}
-            yield {"event": "message", "data": "[DONE]"}
-            break
+        name = body["name"]
+        rate_limit = body.get("rate_limit", DEFAULT_RATE_LIMIT)
+
+        # Generate key
+        key = f"g4k-{secrets.token_hex(16)}"
+        key_hash = _hash_key(key)
+        key_prefix = key[:12]
+
+        # Store key
+        keys = _load_keys()
+        keys[key_prefix] = {
+            "key_hash": key_hash,
+            "key_prefix": key_prefix,
+            "name": name,
+            "created_at": time.time(),
+            "rate_limit": rate_limit,
+            "enabled": True,
+        }
+        _save_keys(keys)
+
+        log.info(f"[{req_id}] Created API key: {key_prefix}")
+
+        return {
+            "key_prefix": key_prefix,
+            "key": key,  # Only returned once
+            "name": name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "rate_limit": rate_limit,
+            "enabled": True,
+        }
+
+    elif method == "GET":
+        # List keys
+        keys = _load_keys()
+        result = []
+        for prefix, data in keys.items():
+            result.append({
+                "key_prefix": prefix,
+                "name": data.get("name", "Unknown"),
+                "created_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(data.get("created_at", 0))
+                ),
+                "rate_limit": data.get("rate_limit", DEFAULT_RATE_LIMIT),
+                "enabled": data.get("enabled", True),
+            })
+        return {"keys": result}
+
+    elif method == "PUT":
+        # Revoke/update key
+        if "key_prefix" not in body:
+            return JSONResponse(
+                status_code=400,
+                content=_error_response("Missing 'key_prefix' field", "invalid_request_error")
+            )
+
+        key_prefix = body["key_prefix"]
+        action = body.get("action", "revoke")
+
+        keys = _load_keys()
+        if key_prefix not in keys:
+            return JSONResponse(
+                status_code=404,
+                content=_error_response(f"Key '{key_prefix}' not found", "invalid_request_error")
+            )
+
+        if action == "revoke":
+            keys[key_prefix]["enabled"] = False
+            log.info(f"[{req_id}] Revoked API key: {key_prefix}")
+        elif action == "enable":
+            keys[key_prefix]["enabled"] = True
+            log.info(f"[{req_id}] Enabled API key: {key_prefix}")
+        elif "rate_limit" in body:
+            keys[key_prefix]["rate_limit"] = body["rate_limit"]
+            log.info(f"[{req_id}] Updated rate limit for {key_prefix}")
+
+        _save_keys(keys)
+        return {"status": "ok"}
+
+    return JSONResponse(
+        status_code=405,
+        content=_error_response(f"Method {method} not allowed", "invalid_request_error")
+    )
+
+
+@app.get("/v1/config")
+async def config(raw_request: Request):
+    """Get server configuration (master-key protected)."""
+    if MASTER_KEY and not _check_master_key(raw_request):
+        return JSONResponse(
+            status_code=401,
+            content=_error_response("Invalid or missing master key", "authentication_error")
+        )
+
+    vram = {}
+    if torch.cuda.is_available():
+        vram["used_gb"] = round(torch.cuda.memory_allocated() / 1024**3, 2)
+        vram["total_gb"] = round(
+            torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+        )
+    else:
+        vram["used_gb"] = 0
+        vram["total_gb"] = 0
+
+    uptime = time.time() - SERVER_START_TIME
+    keys = _load_keys()
+    active_keys = sum(1 for k in keys.values() if k.get("enabled"))
+
+    return ConfigResponse(
+        model=MODEL_ID,
+        version="2.0.0",
+        vram_used_gb=vram["used_gb"],
+        vram_total_gb=vram["total_gb"],
+        active_keys=active_keys,
+        uptime_seconds=uptime,
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
