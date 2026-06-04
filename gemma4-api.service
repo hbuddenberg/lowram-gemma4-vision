@@ -1,0 +1,23 @@
+[Unit]
+Description=Gemma 4 E4B Heretic — OpenAI-Compatible API Server
+After=nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/home/hbuddenberg/lowram-gemma4-vision/.venv/bin/python server.py --host 0.0.0.0 --port 8080
+WorkingDirectory=/home/hbuddenberg/lowram-gemma4-vision
+Environment=GEMMA4_MODEL_PATH=/home/hbuddenberg/models/gemma4-heretic
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Give it time to load the model (~90s)
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=30
+
+# Graceful shutdown
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
