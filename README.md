@@ -189,6 +189,18 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**curl (streaming with usage in final chunk):**
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e4b-heretic",
+    "messages": [{"role": "user", "content": "Count to 10"}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+```
+
 **curl (vision with base64 image):**
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -256,17 +268,19 @@ curl http://localhost:8080/health
 
 | Metric | Value |
 |--------|-------|
-| Text generation | ~4.2 tok/s |
-| Vision analysis | ~5.6-7.5 tok/s |
+| Text generation | ~6.8 tok/s (avg over 10 runs) |
+| Vision analysis | ~7.2 tok/s (after warmup) |
+| Text latency (128 tok) | ~10.7s avg |
+| Vision latency (256 tok) | ~15-24s (first slower due to image encoding) |
 | VRAM usage | 9.3GB / 11.6GB (RTX 3060 12GB) |
 | Model load time | ~90 seconds |
 | First token latency | ~5 seconds (vision) |
 
-Tested on: Intel i5-7260U (7.6GB RAM) + RTX 3060 12GB via Thunderbolt 3.
+Tested on: Intel i5-7260U (7.6GB RAM) + RTX 3060 12GB via Thunderbolt 3. Benchmarks: 10 text runs, 5 vision runs.
 
-## Architecture
+### Architecture
 
-```
+```text
 Gemma4ForConditionalGeneration
 ├── model (Gemma4Model)
 │   ├── vision_tower (Gemma4VisionModel)     — 16 layers, 768d, fp16
@@ -275,6 +289,12 @@ Gemma4ForConditionalGeneration
 │   └── audio_tower                           — skipped (not used)
 └── lm_head (Linear 2560→262144)             — fp16
 ```
+
+**Response parsing**: Uses `transformers` official `processor.parse_response()` (v5.10+) with the model's `tokenizer_config.json` `response_schema`. Handles Gemma 4 native markers:
+- `<|tool_call>call:name{...}<tool_call|>` → structured tool calls (JSON args)
+- `<|channel>thought...<channel|>` → reasoning/thinking content
+- `<|\"|>` quote tokens → proper JSON strings
+- No custom regex — all parsing via HuggingFace's `chat_parsing_utils.recursive_parse` with `gemma4-tool-call` parser.
 
 ## Troubleshooting
 

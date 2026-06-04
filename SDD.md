@@ -158,10 +158,10 @@ Prefix:  "a1b2c3d4" (first 8 hex chars, used as ID)
 | `presence_penalty` | float | ✅ | Combined with frequency |
 | `stop` | array | ✅ | Via `StopSequenceCriteria` |
 | `images` | array | ✅ | Vision input (base64, URL, local path) |
+| `stream_options` | object | ✅ | `include_usage: true` adds usage to final stream chunk |
 | `n` | int | ❌ | Constrained to 1 (single GPU) |
 | `logprobs` | bool | ❌ | Not supported by transformers |
-| `stream_options` | object | ❌ | Planned |
-
+| `top_logprobs` | int | ❌ | Not supported by transformers |
 ---
 
 ## 5. Security
@@ -264,7 +264,7 @@ WantedBy=default.target
 - **SQLite single-writer**: Not suitable for multi-node deployment
 
 ### Future Work
-- [ ] `stream_options.include_usage` for streaming token counts
+- [x] `stream_options.include_usage` for streaming token counts
 - [ ] Multi-model support (serve different models per endpoint)
 - [ ] Web UI for key management
 - [ ] Prometheus metrics endpoint

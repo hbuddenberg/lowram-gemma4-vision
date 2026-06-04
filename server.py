@@ -1326,20 +1326,26 @@ async def _stream_generator(
                 # Determine finish_reason
                 finish_reason = "tool_calls" if final_tool_calls else "stop"
 
+                # Check stream_options.include_usage
+                include_usage = req.stream_options and req.stream_options.get("include_usage", False)
+
+                final_chunk = {
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [{"index": 0, "delta": final_delta, "finish_reason": finish_reason}],
+                }
+                if include_usage:
+                    final_chunk["usage"] = {
+                        "prompt_tokens": total_prompt,
+                        "completion_tokens": total_completion,
+                        "total_tokens": total_prompt + total_completion,
+                    }
+
                 yield {
                     "event": "message",
-                    "data": json.dumps({
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "choices": [{"index": 0, "delta": final_delta, "finish_reason": finish_reason}],
-                        "usage": {
-                            "prompt_tokens": total_prompt,
-                            "completion_tokens": total_completion,
-                            "total_tokens": total_prompt + total_completion,
-                        },
-                    }),
+                    "data": json.dumps(final_chunk),
                 }
                 yield {"event": "message", "data": "[DONE]"}
                 log.info(
