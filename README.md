@@ -116,6 +116,111 @@ python inference.py path/to/your/image.jpg             # Text + your image
 GEMMA4_MODEL_PATH=~/models/gemma4-heretic python inference.py  # Custom model path
 ```
 
+## OpenAI-Compatible API Server
+
+Run Gemma 4 as a local OpenAI-compatible API — use it from any tool that supports OpenAI endpoints (Hermes, curl, OpenAI SDK, Continue, etc.).
+
+### Quick Start
+
+```bash
+# Start the server (loads model on startup, ~90s)
+./start.sh --port 8080
+
+# Or directly:
+.venv/bin/python server.py --port 8080
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | OpenAI-compatible chat (streaming + non-streaming) |
+| `/v1/models` | GET | List available models |
+| `/health` | GET | Health check + VRAM status |
+
+### Usage Examples
+
+**curl (text):**
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e4b-heretic",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 128,
+    "stream": false
+  }'
+```
+
+**curl (streaming):**
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e4b-heretic",
+    "messages": [{"role": "user", "content": "Count to 10"}],
+    "stream": true
+  }'
+```
+
+**curl (vision with base64 image):**
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e4b-heretic",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+        {"type": "text", "text": "Describe this image"}
+      ]
+    }],
+    "max_tokens": 512
+  }'
+```
+
+**Python (OpenAI SDK):**
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="gemma4-local")
+response = client.chat.completions.create(
+    model="gemma-4-e4b-heretic",
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+```
+
+### Connect to Hermes Agent
+
+Add as a custom provider in `~/.hermes/config.yaml`:
+
+```yaml
+custom_providers:
+  - name: gemma4-local
+    base_url: http://localhost:8080/v1
+    api_key: gemma4-local
+    model: gemma-4-e4b-heretic
+```
+
+Then switch to it: `hermes model` → select `gemma4-local`.
+
+### Systemd Service (auto-start)
+
+```bash
+# Install the user service
+mkdir -p ~/.config/systemd/user/
+cp gemma4-api.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now gemma4-api.service
+
+# Check status (takes ~90s to load model)
+systemctl --user status gemma4-api.service
+curl http://localhost:8080/health
+```
+
 ## Performance
 
 | Metric | Value |
@@ -165,7 +270,10 @@ lowram-gemma4-vision/
 ├── README.md
 ├── LICENSE (MIT)
 ├── requirements.txt
-├── inference.py                 # Main script
+├── inference.py                 # Standalone text + vision script
+├── server.py                    # OpenAI-compatible API server (FastAPI)
+├── start.sh                     # Quick start script
+├── gemma4-api.service           # systemd user service
 ├── .env.example
 ├── .gitignore
 ├── docs/PLANNING/
