@@ -30,7 +30,24 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
+
+# Pre-compiled regex patterns for Gemma 4 output markers.
+# Using re.escape() for markers because raw-string \| is unreliable across Python versions.
+# NOTE: Gemma 4 tool_call markers are ASYMMETRIC:
+#   Opening: <|tool_call>
+#   Closing: <tool_call|>
+_TC_OPEN = re.escape("<|tool_call>")
+_TC_CLOSE = re.escape("<tool_call|>")
+_THINK_MARKER = re.escape("<|think|>")
+_TURN_MARKER = re.escape("<|turn|>")
+RE_THINKING = re.compile(_THINK_MARKER + r"(.*?)" + _TURN_MARKER, re.DOTALL)
+RE_TOOL_CALLS = re.compile(
+    _TC_OPEN + r"call:(\w+)\{(.+?)\}" + _TC_CLOSE, re.DOTALL
+)
+RE_CLEAN_THINKING = re.compile(_THINK_MARKER + r".*?" + _TURN_MARKER, re.DOTALL)
+RE_CLEAN_TOOL_CALLS = re.compile(_TC_OPEN + r".*?" + _TC_CLOSE, re.DOTALL)
 import sqlite3
 import threading
 import time
@@ -314,7 +331,7 @@ def _persist_key(key_prefix: str, key_data: dict) -> None:
 				(key_hash, key_prefix, name, created_at, expires_at, last_used_at,
 				 is_active, usage_count, total_tokens, rate_limit)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(key_prefix) DO UPDATE SET
+			ON CONFLICT(key_hash) DO UPDATE SET
 				key_hash = excluded.key_hash,
 				name = excluded.name,
 				created_at = excluded.created_at,
@@ -454,6 +471,10 @@ class ChatCompletionRequest(BaseModel):
     logprobs: bool = False
     top_logprobs: int | None = None
     stream_options: dict | None = None
+    tools: list[dict] | None = None
+    tool_choice: str | None = None
+    enable_thinking: bool = False
+    reasoning_effort: str | None = None
 
     @field_validator("messages")
     @classmethod
@@ -691,8 +712,14 @@ def _build_messages(messages: list[ChatMessage]) -> list[dict]:
     return result
 
 
-def _prepare_inputs(model, processor, messages: list[ChatMessage]):
-    """Tokenize messages and move tensors to model device."""
+def _prepare_inputs(
+    model,
+    processor,
+    messages: list[ChatMessage],
+    tools: list[dict] | None = None,
+    enable_thinking: bool = False,
+):
+    """Tokenize messages with apply_chat_template; support tools, thinking, vision."""
     has_images = False
     all_images: list[Image.Image] = []
     for msg in messages:
@@ -703,15 +730,19 @@ def _prepare_inputs(model, processor, messages: list[ChatMessage]):
 
     chat_messages = _build_messages(messages)
 
+    # use apply_chat_template with tools and thinking support
+    text = processor.apply_chat_template(
+        chat_messages,
+        tools=tools,
+        enable_thinking=enable_thinking,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
     if has_images:
-        text = processor.apply_chat_template(
-            chat_messages, tokenize=False, add_generation_prompt=True
-        )
         inputs = processor(text=[text], images=all_images[:1], return_tensors="pt")
     else:
-        inputs = processor.apply_chat_template(
-            chat_messages, tokenize=True, return_tensors="pt", return_dict=True
-        )
+        inputs = processor(text=text, return_tensors="pt")
 
     inputs_gpu = {
         k: v.to(model.device) if isinstance(v, torch.Tensor) else v
@@ -727,10 +758,14 @@ def generate_sync(
     temperature: float = DEFAULT_TEMPERATURE,
     top_p: float = DEFAULT_TOP_P,
     stop: list[str] | None = None,
-) -> tuple[str, int, int]:
-    """Run synchronous generation; return (text, prompt_tokens, completion_tokens)."""
+    tools: list[dict] | None = None,
+    enable_thinking: bool = False,
+) -> tuple[str, int, int, str | None, list[dict] | None]:
+    """Run synchronous generation; return (text, prompt_tokens, completion_tokens, reasoning, tool_calls)."""
     model, processor = load_model(MODEL_PATH)
-    inputs_gpu, input_len, _ = _prepare_inputs(model, processor, messages)
+    inputs_gpu, input_len, _ = _prepare_inputs(
+        model, processor, messages, tools=tools, enable_thinking=enable_thinking
+    )
 
     gen_kwargs: dict = {
         "max_new_tokens": max_tokens,
@@ -745,7 +780,40 @@ def generate_sync(
     with torch.no_grad():
         outputs = model.generate(**inputs_gpu, **gen_kwargs)
 
-    response = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
+    # Decode full output with special tokens for regex extraction
+    full_text = processor.decode(outputs[0], skip_special_tokens=False)
+
+    # DEBUG: log raw output for tool call debugging
+    log.debug(f"[DEBUG] full_text (last 300): ...{full_text[-300:]}")
+
+    # Decode only generated tokens (skip special tokens) for clean response
+    clean_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+    # Extract thinking content (pre-compiled regex with re.escape markers)
+    reasoning_content = None
+    think_match = RE_THINKING.search(full_text)
+    if think_match:
+        reasoning_content = think_match.group(1).strip()
+
+    # Extract tool calls — Gemma 4 uses single braces and <|\"|> for quotes
+    tool_calls = None
+    tc_matches = RE_TOOL_CALLS.findall(full_text)
+    if tc_matches:
+        tool_calls = []
+        for i, (name, args) in enumerate(tc_matches):
+            # Clean up special quote tokens <|\"|> -> "
+            args_clean = args.replace("<|\"|>", '"')
+            tool_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_clean},
+                }
+            )
+
+    # Clean up response: remove thinking and tool call markers
+    response = RE_CLEAN_THINKING.sub("", clean_text)
+    response = RE_CLEAN_TOOL_CALLS.sub("", response).strip()
 
     if stop:
         for seq in stop:
@@ -755,7 +823,7 @@ def generate_sync(
                 break
 
     comp_tokens = len(processor.tokenizer.encode(response, add_special_tokens=False))
-    return response, input_len, comp_tokens
+    return response, input_len, comp_tokens, reasoning_content, tool_calls
 
 
 # ── FastAPI lifespan ──────────────────────────────────────────────────────────
@@ -942,9 +1010,15 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
 
         async with INFERENCE_SEMAPHORE:
             try:
-                response_text, prompt_tokens, completion_tokens = await loop.run_in_executor(
+                # Determine thinking: reasoning_effort takes precedence
+                enable_thinking = req.enable_thinking
+                if req.reasoning_effort:
+                    enable_thinking = req.reasoning_effort != "low"
+
+                response_text, prompt_tokens, completion_tokens, reasoning, tool_calls = await loop.run_in_executor(
                     None, generate_sync,
                     req.messages, req.max_tokens, req.temperature, req.top_p, req.stop,
+                    req.tools, enable_thinking,
                 )
                 latency_ms = (time.time() - req_start) * 1000
                 await loop.run_in_executor(
@@ -955,6 +1029,20 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                     f"[{req_id}] completed: {prompt_tokens}+{completion_tokens} tokens, "
                     f"{latency_ms:.0f}ms"
                 )
+
+                # Build response message with optional reasoning and tool_calls
+                message: dict = {"role": "assistant"}
+                if tool_calls:
+                    message["content"] = None  # OpenAI: null content when tool_calls present
+                    message["tool_calls"] = tool_calls
+                else:
+                    message["content"] = response_text
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+
+                # Determine finish_reason
+                finish_reason = "tool_calls" if tool_calls else "stop"
+
                 return ChatCompletionResponse(
                     id=req_id,
                     created=created,
@@ -962,8 +1050,8 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                     choices=[
                         ChatCompletionChoice(
                             index=0,
-                            message={"role": "assistant", "content": response_text},
-                            finish_reason="stop",
+                            message=message,
+                            finish_reason=finish_reason,
                         )
                     ],
                     usage=Usage(
@@ -1012,11 +1100,18 @@ async def _stream_generator(
 
     def _run_inference() -> None:
         try:
+            # Determine thinking: reasoning_effort takes precedence
+            enable_thinking = req.enable_thinking
+            if req.reasoning_effort:
+                enable_thinking = req.reasoning_effort != "low"
+
             model, processor = load_model(MODEL_PATH)
-            inputs_gpu, input_len, _ = _prepare_inputs(model, processor, req.messages)
+            inputs_gpu, input_len, _ = _prepare_inputs(
+                model, processor, req.messages, tools=req.tools, enable_thinking=enable_thinking
+            )
 
             streamer = TextIteratorStreamer(
-                processor.tokenizer, skip_prompt=True, skip_special_tokens=True
+                processor.tokenizer, skip_prompt=True, skip_special_tokens=False
             )
             gen_kwargs: dict = {
                 **inputs_gpu,
@@ -1036,20 +1131,106 @@ async def _stream_generator(
             thread.start()
 
             accumulated = ""
+            in_thinking = False
+            in_tool_call = False
+            current_tc_name = ""
+            current_tc_args = ""
+            current_tc_index = -1
             asyncio.run_coroutine_threadsafe(queue.put(("role", input_len)), loop)
 
             for chunk in streamer:
                 if chunk:
                     accumulated += chunk
-                    asyncio.run_coroutine_threadsafe(queue.put(("content", chunk)), loop)
+
+                    # Detect thinking blocks
+                    if "<|think|>" in chunk:
+                        in_thinking = True
+                        asyncio.run_coroutine_threadsafe(queue.put(("thinking_start",)), loop)
+                    elif "<|turn|>" in chunk and in_thinking:
+                        in_thinking = False
+                        asyncio.run_coroutine_threadsafe(queue.put(("thinking_end",)), loop)
+                    elif in_thinking:
+                        asyncio.run_coroutine_threadsafe(queue.put(("thinking", chunk)), loop)
+
+                    # Detect tool calls — markers are asymmetric:
+                    # Opening: <|tool_call>   Closing: <tool_call|>
+                    if "<|tool_call>" in chunk:
+                        # Opening marker — start collecting a new tool call
+                        in_tool_call = True
+                        current_tc_index += 1
+                        current_tc_name = ""
+                        current_tc_args = ""
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put((
+                                "tool_call_start",
+                                current_tc_index,
+                                f"call_{uuid.uuid4().hex[:8]}",
+                            )), loop,
+                        )
+                    elif "<tool_call|>" in chunk:
+                        # Closing marker — finalize this tool call
+                        in_tool_call = False
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put(("tool_call_end",)), loop,
+                        )
+                    elif in_tool_call:
+                        # Accumulate tool call content, extract name and args
+                        current_tc_args += chunk
+                        # Try to detect function name from "call:name{{"
+                        name_match = re.match(r"call:(\w+)\{\{", current_tc_args)
+                        if name_match:
+                            tc_name = name_match.group(1)
+                            if tc_name != current_tc_name:
+                                current_tc_name = tc_name
+                                # Strip the "call:name{{" prefix from args
+                                remaining = current_tc_args[name_match.end():]
+                                asyncio.run_coroutine_threadsafe(
+                                    queue.put(("tool_call_name", current_tc_index, current_tc_name)), loop,
+                                )
+                                if remaining:
+                                    asyncio.run_coroutine_threadsafe(
+                                        queue.put(("tool_call_arg", current_tc_index, remaining)), loop,
+                                    )
+                        else:
+                            # Accumulate raw args text
+                            asyncio.run_coroutine_threadsafe(
+                                queue.put(("tool_call_arg", current_tc_index, chunk)), loop,
+                            )
+                    elif not in_thinking:
+                        # Content chunk (not in thinking or tool call)
+                        asyncio.run_coroutine_threadsafe(queue.put(("content", chunk)), loop)
 
             thread.join()
 
+            # Parse final accumulated text for thinking and tool calls
+            reasoning_content = None
+            think_match = RE_THINKING.search(accumulated)
+            if think_match:
+                reasoning_content = think_match.group(1).strip()
+
+            tool_calls = None
+            tc_matches = RE_TOOL_CALLS.findall(accumulated)
+            if tc_matches:
+                tool_calls = []
+                for i, (name, args) in enumerate(tc_matches):
+                    tool_calls.append(
+                        {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        }
+                    )
+
+            # Clean accumulated for token count
+            clean_accumulated = RE_CLEAN_THINKING.sub("", accumulated)
+            clean_accumulated = RE_CLEAN_TOOL_CALLS.sub("", clean_accumulated)
+            clean_accumulated = clean_accumulated.strip()
+
             comp_tokens = len(
-                processor.tokenizer.encode(accumulated, add_special_tokens=False)
+                processor.tokenizer.encode(clean_accumulated, add_special_tokens=False)
             )
             asyncio.run_coroutine_threadsafe(
-                queue.put(("done", input_len, comp_tokens)), loop
+                queue.put(("done", input_len, comp_tokens, reasoning_content, tool_calls)), loop
             )
         except Exception as exc:
             error_holder[0] = exc
@@ -1059,6 +1240,8 @@ async def _stream_generator(
 
     total_prompt = 0
     total_completion = 0
+    current_reasoning = ""
+    current_tool_calls = None
 
     try:
         while True:
@@ -1080,6 +1263,37 @@ async def _stream_generator(
                     }),
                 }
 
+            elif tag == "thinking_start":
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model,
+                        "choices": [
+                            {"index": 0, "delta": {"reasoning_content": ""}, "finish_reason": None}
+                        ],
+                    }),
+                }
+
+            elif tag == "thinking":
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model,
+                        "choices": [
+                            {"index": 0, "delta": {"reasoning_content": item[1]}, "finish_reason": None}
+                        ],
+                    }),
+                }
+
+            elif tag == "thinking_end":
+                pass  # no-op, next chunk type will be content
+
             elif tag == "content":
                 yield {
                     "event": "message",
@@ -1094,15 +1308,117 @@ async def _stream_generator(
                     }),
                 }
 
+            elif tag == "tool_call_start":
+                # OpenAI incremental tool_call: first chunk has id, type, name
+                tc_idx = item[1]
+                tc_id = item[2]
+                if current_tool_calls is None:
+                    current_tool_calls = {}
+                current_tool_calls[tc_idx] = {
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tc_idx,
+                                        "id": tc_id,
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }),
+                }
+
+            elif tag == "tool_call_name":
+                tc_idx = item[1]  # index passed from producer
+                if current_tool_calls and tc_idx in current_tool_calls:
+                    tc_name_val = item[2] if len(item) > 2 else ""
+                    current_tool_calls[tc_idx]["function"]["name"] = tc_name_val
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{
+                                            "index": tc_idx,
+                                            "function": {"name": tc_name_val},
+                                        }]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }),
+                    }
+
+            elif tag == "tool_call_arg":
+                tc_idx = item[1]  # index passed from producer
+                arg_text = item[2]
+                if current_tool_calls and tc_idx in current_tool_calls:
+                    current_tool_calls[tc_idx]["function"]["arguments"] += arg_text
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{
+                                            "index": tc_idx,
+                                            "function": {"arguments": arg_text},
+                                        }]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }),
+                    }
+
+            elif tag == "tool_call_end":
+                pass  # Final done chunk carries finish_reason
+
             elif tag == "done":
                 total_prompt = item[1]
                 total_completion = item[2]
+                final_reasoning = item[3]
+                final_tool_calls = item[4]
                 latency_ms = (time.time() - req_start) * 1000
 
                 await asyncio.get_running_loop().run_in_executor(
                     None, _log_usage_sync,
                     key_prefix, req.model, total_prompt, total_completion, latency_ms,
                 )
+
+                # Build final delta
+                final_delta: dict = {}
+                if final_tool_calls:
+                    final_delta["tool_calls"] = final_tool_calls
+
+                # Determine finish_reason
+                finish_reason = "tool_calls" if final_tool_calls else "stop"
 
                 yield {
                     "event": "message",
@@ -1111,7 +1427,7 @@ async def _stream_generator(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": final_delta, "finish_reason": finish_reason}],
                         "usage": {
                             "prompt_tokens": total_prompt,
                             "completion_tokens": total_completion,
