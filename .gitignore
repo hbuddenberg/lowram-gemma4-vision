@@ -3,3 +3,5 @@ models/
 *.gguf
 __pycache__/
 .env
+venv/
+docs/PLANNING/

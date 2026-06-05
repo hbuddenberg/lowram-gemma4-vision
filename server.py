@@ -30,6 +30,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -39,6 +40,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
+
+# Configure CUDA allocator to reduce fragmentation (critical for 12GB VRAM)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import requests as _requests
 import torch
@@ -57,6 +61,7 @@ from transformers import (
     StoppingCriteriaList,
     TextIteratorStreamer,
 )
+from rag import get_rag_store
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -81,9 +86,10 @@ REQUESTS_IN_FLIGHT = 0
 REQUESTS_IN_FLIGHT_LOCK = threading.Lock()
 
 # ── Configurable defaults ─────────────────────────────────────────────────────
-DEFAULT_MAX_TOKENS = 512
+DEFAULT_MAX_TOKENS = 128  # Further reduced for 12GB VRAM
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.9
+MAX_CONTEXT_MESSAGES = 4  # Max 2 turns (user-assistant-user-assistant) to avoid OOM
 # Legacy single-key backward compat (used when MASTER_KEY is unset)
 API_KEY = os.environ.get("GEMMA4_API_KEY", "gemma4-local")
 # Accept both env var names for smooth migration
@@ -91,6 +97,16 @@ MASTER_KEY = os.environ.get("GEMMA4_MASTER_KEY") or os.environ.get("GEMMA4_ADMIN
 MAX_IMAGE_SIZE_MB = int(os.environ.get("GEMMA4_MAX_IMAGE_MB", "20"))
 VALID_ROLES = {"system", "user", "assistant", "tool"}
 DEFAULT_RATE_LIMIT = 30  # requests per minute per key (single GPU default)
+RAG_ENABLED = os.environ.get("GEMMA4_RAG", "1").lower() in ("1", "true", "yes")
+
+# ── Input/generation limits (critical for 12GB VRAM) ─────────────────────────
+# Max input tokens the server will accept. Gemma 4 E4B with NF4 on 12GB VRAM
+# starts thrashing past ~6K tokens. This is a hard reject boundary.
+MAX_INPUT_TOKENS = int(os.environ.get("GEMMA4_MAX_INPUT_TOKENS", "4096"))
+# Soft limit: messages beyond this get summarized/chunked before reaching the model
+CHUNK_THRESHOLD_TOKENS = int(os.environ.get("GEMMA4_CHUNK_THRESHOLD", "2048"))
+# Max wall-clock seconds for a single generation (prevents 15-min hangs)
+GENERATION_TIMEOUT = int(os.environ.get("GEMMA4_GEN_TIMEOUT", "120"))  # 2 min
 
 # ── Storage paths ─────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".gemma4api"
@@ -103,6 +119,19 @@ _CORS_ORIGINS = [o.strip() for o in os.environ.get("GEMMA4_CORS_ORIGINS", "*").s
 
 # ── Security: allowed image directory (empty = deny all file:// paths) ────────
 ALLOWED_IMAGE_DIR = os.environ.get("GEMMA4_IMAGE_DIR", "")
+
+# ── Default system prompt (injected when client sends none) ───────────────────
+DEFAULT_SYSTEM_PROMPT = os.environ.get(
+    "GEMMA4_SYSTEM_PROMPT",
+    "Eres un asistente útil y conciso. Responde SIEMPRE en el mismo idioma que el usuario. "
+    "Si el usuario escribe en español, responde en español. "
+    "Si el usuario escribe en inglés, responde en inglés.",
+)
+
+# ── Session management ────────────────────────────────────────────────────────
+# Sessions allow RAG to track conversations across requests and cache system prompts.
+# Session ID is derived from: X-Session-ID header > message content hash > "default"
+SESSION_IDLE_TIMEOUT = int(os.environ.get("GEMMA4_SESSION_TIMEOUT", "3600"))  # 1 hour
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -144,6 +173,15 @@ def _init_db_sync() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_req_log_key ON request_log(key_prefix)"
         )
+        # ── Sessions table: caches system prompts per conversation ──────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id   TEXT PRIMARY KEY,
+                system_prompt TEXT,
+                created_at   REAL NOT NULL,
+                last_used_at REAL NOT NULL
+            )
+        """)
         conn.commit()
 
     if _LEGACY_KEYS_FILE.exists():
@@ -404,6 +442,237 @@ def _delete_key(key_prefix: str) -> None:
 			conn.commit()
 
 
+# ── Session management helpers ────────────────────────────────────────────────
+
+# In-memory session cache: session_id -> {system_prompt, created_at, last_used_at}
+_SESSIONS_CACHE: dict[str, dict] = {}
+_SESSIONS_CACHE_LOCK = threading.RLock()
+
+
+def _get_or_create_session(session_id: str, system_prompt: Optional[str] = None) -> dict:
+    """Get or create a session, optionally caching its system prompt. Returns session data."""
+    now = time.time()
+    with _SESSIONS_CACHE_LOCK:
+        if session_id in _SESSIONS_CACHE:
+            session = _SESSIONS_CACHE[session_id]
+            session["last_used_at"] = now
+            # Update system prompt if provided and different
+            if system_prompt and system_prompt != session.get("system_prompt"):
+                session["system_prompt"] = system_prompt
+                _persist_session(session_id, session)
+            return session
+
+        # Try loading from SQLite
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+
+        if row:
+            session = dict(row)
+            session["last_used_at"] = now
+            if system_prompt:
+                session["system_prompt"] = system_prompt
+            _SESSIONS_CACHE[session_id] = session
+            _persist_session(session_id, session)
+            return session
+
+        # Create new session
+        session = {
+            "session_id": session_id,
+            "system_prompt": system_prompt,
+            "created_at": now,
+            "last_used_at": now,
+        }
+        _SESSIONS_CACHE[session_id] = session
+        _persist_session(session_id, session)
+        return session
+
+
+def _persist_session(session_id: str, session: dict) -> None:
+    """Write session to SQLite. Must be called under _SESSIONS_CACHE_LOCK."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (session_id, system_prompt, created_at, last_used_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                system_prompt = excluded.system_prompt,
+                last_used_at = excluded.last_used_at
+            """,
+            (session_id, session.get("system_prompt"), session.get("created_at"), session.get("last_used_at")),
+        )
+        conn.commit()
+
+
+def _derive_session_id(messages: "list[ChatMessage]") -> str:
+    """Derive a stable session ID from the first user message content.
+    
+    This ensures the same conversation gets the same session ID across requests,
+    enabling RAG to retrieve context from earlier messages in the same conversation.
+    """
+    for msg in messages:
+        if msg.role == "user":
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if content:
+                # Hash first 200 chars of first user message for stable session ID
+                return f"s-{hashlib.sha256(content[:200].encode()).hexdigest()[:16]}"
+    return "s-default"
+
+
+def _cleanup_idle_sessions() -> None:
+    """Remove sessions idle longer than SESSION_IDLE_TIMEOUT."""
+    cutoff = time.time() - SESSION_IDLE_TIMEOUT
+    with _SESSIONS_CACHE_LOCK:
+        to_remove = [
+            sid for sid, s in _SESSIONS_CACHE.items()
+            if s.get("last_used_at", 0) < cutoff
+        ]
+        for sid in to_remove:
+            del _SESSIONS_CACHE[sid]
+    if to_remove:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM sessions WHERE session_id IN (%s) AND last_used_at < ?"
+                % ",".join("?" * len(to_remove)),
+                to_remove + [cutoff],
+            )
+            conn.commit()
+        log.debug(f"Cleaned up {len(to_remove)} idle sessions")
+
+
+# ── URL auto-fix for tool calls ───────────────────────────────────────────────
+
+# Regex: bare domain like "todorelatos.com", "example.org/path" — no scheme
+_BARE_DOMAIN_RE = re.compile(
+    r"^(?![a-zA-Z][a-zA-Z0-9+.\-]*://)"  # Not already a URL with scheme
+    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?\.)+"  # Domain parts
+    r"[a-zA-Z]{2,}"  # TLD
+    r"(?:/[^\s]*)?$"  # Optional path
+)
+
+
+def _fix_tool_call_urls(tool_calls: list[dict]) -> list[dict]:
+    """Auto-prepend https:// to bare domains in tool call string arguments.
+    
+    Many models generate tool calls with bare domains like "todorelatos.com"
+    instead of "https://todorelatos.com". Client apps often validate URL format
+    with Pydantic (format: "url") which rejects bare domains.
+    """
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        args_str = func.get("arguments", "{}")
+        if isinstance(args_str, str):
+            try:
+                args = json.loads(args_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            modified = False
+            for key, value in args.items():
+                if isinstance(value, str) and _BARE_DOMAIN_RE.match(value):
+                    args[key] = f"https://{value}"
+                    modified = True
+            if modified:
+                func["arguments"] = json.dumps(args, ensure_ascii=False)
+    return tool_calls
+
+
+# ── Input token estimation & chunking ────────────────────────────────────────
+
+def _estimate_tokens(messages: "list[ChatMessage]") -> int:
+    """Rough token count estimation for messages before tokenization.
+    
+    Uses a simple heuristic: ~4 chars per token for mixed text.
+    This is fast (no tokenizer call) and used for early rejection.
+    After trimming/chunking, the actual tokenizer count is used.
+    """
+    total_chars = 0
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    total_chars += len(item)
+                elif isinstance(item, dict):
+                    if item.get("type") == "text":
+                        total_chars += len(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        total_chars += 256  # Approximate image token count
+        # Role + formatting overhead
+        total_chars += 20
+    return total_chars // 4  # ~4 chars per token for multilingual text
+
+
+def _chunk_long_message(text: str, max_chunk_tokens: int = 800) -> list[str]:
+    """Split a long text into chunks of approximately max_chunk_tokens each.
+    
+    Tries to split on sentence boundaries (period, newline) first.
+    Falls back to fixed-size chunks if no good split points found.
+    """
+    # Target chars per chunk (~4 chars/token)
+    max_chars = max_chunk_tokens * 4
+    
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    remaining = text
+    
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining)
+            break
+        
+        # Try to split at sentence boundary within the window
+        split_point = max_chars
+        
+        # Look backwards for sentence boundaries
+        for i in range(min(len(remaining), max_chars), max(max_chars // 2, 0), -1):
+            if i < len(remaining) and remaining[i] in ".\n!?\r":
+                split_point = i + 1
+                break
+        
+        chunk = remaining[:split_point].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_point:].strip()
+    
+    return chunks
+
+
+def _summarize_message_chunk(text: str, session_id: str) -> str:
+    """Use RAG to extract a summary of a long message chunk.
+    
+    Instead of running the model for summarization (expensive), we store
+    the full text in RAG and return a truncated version with a marker.
+    The full text is still searchable via FAISS for later retrieval.
+    """
+    # Store the full text in RAG for retrieval
+    try:
+        rag = get_rag_store()
+        rag.store_messages(session_id, [
+            {"role": "user", "content": text}
+        ])
+    except Exception:
+        pass
+    
+    # Return truncated version (first ~500 chars ≈ 125 tokens)
+    max_preview = 500
+    if len(text) <= max_preview:
+        return text
+    
+    # Find a good cutoff point
+    cutoff = text[:max_preview]
+    last_period = cutoff.rfind(".")
+    if last_period > max_preview // 2:
+        cutoff = cutoff[:last_period + 1]
+    
+    return f"{cutoff} [...] [Texto largo almacenado en RAG — {len(text)} chars totales]"
+
+
 # ── Stopping criteria ─────────────────────────────────────────────────────────
 
 class StopSequenceCriteria(StoppingCriteria):
@@ -469,6 +738,44 @@ class ChatCompletionRequest(BaseModel):
         if not v:
             raise ValueError("messages must contain at least one message")
         return v
+
+
+def _chunk_messages(messages: list[ChatMessage], session_id: str) -> list[ChatMessage]:
+    """Process messages with long text: store full text in RAG, replace with summaries.
+    
+    Strategy:
+    1. For each message with text > 3200 chars (~800 tokens), store in RAG and replace
+       with a truncated summary
+    2. Keep the last 2 user messages intact (most relevant context)
+    3. Preserve system messages and tool messages unchanged
+    
+    This ensures long texts (like documents, articles) are:
+    - Fully stored in FAISS for semantic retrieval
+    - Replaced with short previews in the context window
+    - Still accessible when the model needs specific details
+    """
+    # Find the indices of the last 2 user messages to keep intact
+    user_indices = [i for i, m in enumerate(messages) if m.role == "user"]
+    keep_intact = set(user_indices[-2:]) if len(user_indices) >= 2 else set(user_indices)
+    
+    result = []
+    for i, msg in enumerate(messages):
+        # Never modify system, tool, or the last 2 user messages
+        if msg.role in ("system", "tool") or i in keep_intact:
+            result.append(msg)
+            continue
+        
+        content = msg.content
+        if not isinstance(content, str) or len(content) <= 3200:
+            result.append(msg)
+            continue
+        
+        # Long text: store in RAG and summarize
+        summary = _summarize_message_chunk(content, session_id)
+        log.info(f"Chunked {msg.role} msg: {len(content)} → {len(summary)} chars (session={session_id})")
+        result.append(ChatMessage(role=msg.role, content=summary))
+    
+    return result
 
 
 class ChatCompletionChoice(BaseModel):
@@ -641,8 +948,72 @@ def unload_model() -> None:
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
 
+# Image preprocessing: max resolution before passing to Gemma vision encoder.
+# Gemma 4 vision internally resizes to 896×896, so anything larger wastes VRAM.
+IMAGE_MAX_DIMENSION = int(os.environ.get("GEMMA4_IMAGE_MAX_DIM", "896"))
+# JPEG quality for in-memory compression (lower = less VRAM, slight quality loss)
+IMAGE_QUALITY = int(os.environ.get("GEMMA4_IMAGE_QUALITY", "85"))
+
+# VRAM budget: reduce context when vision/audio is present to reserve memory
+CONTEXT_MESSAGES_TEXT = 4     # Text-only: up to 4 messages
+CONTEXT_MESSAGES_VISION = 2  # With image: only 2 messages (reserve ~500 MB)
+CONTEXT_MESSAGES_AUDIO = 3  # With audio: 3 messages (future-proofing)
+
+
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    """Resize and optionally compress image to reduce VRAM during vision encoding.
+
+    - Resizes to IMAGE_MAX_DIMENSION (longest side) maintaining aspect ratio
+    - Converts to RGB (drops alpha channel which wastes memory)
+    - Uses LANCZOS resampling for quality
+    """
+    w, h = img.size
+    max_dim = max(w, h)
+
+    if max_dim > IMAGE_MAX_DIMENSION:
+        scale = IMAGE_MAX_DIMENSION / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        log.debug(f"Image resized: {w}x{h} → {new_w}x{new_h}")
+
+    return img.convert("RGB")
+
+
+def _get_context_budget(messages: list) -> int:
+    """Determine MAX_CONTEXT_MESSAGES based on multimodal content presence.
+
+    When images or audio are in the message history, reduce the context window
+    to reserve VRAM for the vision/audio encoder.
+    """
+    has_vision = False
+    has_audio = False
+
+    for msg in messages:
+        content = msg.content if hasattr(msg, "content") else msg
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    t = item.get("type", "")
+                    if t == "image_url":
+                        has_vision = True
+                    elif t == "input_audio":
+                        has_audio = True
+
+    if has_vision:
+        return CONTEXT_MESSAGES_VISION
+    if has_audio:
+        return CONTEXT_MESSAGES_AUDIO
+    return CONTEXT_MESSAGES_TEXT
+
+
 def _parse_content(content: str | list | None) -> tuple[str, list[Image.Image]]:
-    """Extract text and images from OpenAI-format message content."""
+    """Extract text and images from OpenAI-format message content.
+
+    Images are resized to reduce VRAM usage during vision encoding.
+    Gemma 4 vision encoder processes at fixed internal resolution, so
+    oversized images just waste memory during PIL→processor conversion.
+    """
     if content is None:
         return "", []
     if isinstance(content, str):
@@ -664,8 +1035,9 @@ def _parse_content(content: str | list | None) -> tuple[str, list[Image.Image]]:
                     img_bytes = base64.b64decode(b64)
                     if len(img_bytes) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
                         raise ValueError(f"Image exceeds {MAX_IMAGE_SIZE_MB}MB limit")
-                    images.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-                elif url.startswith("http"):
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    images.append(_preprocess_image(img))
+                elif url.startswith(("http", "ftp")):
                     if _is_private_url(url):
                         raise ValueError("Fetching internal/private URLs is blocked")
                     resp = _requests.get(url, timeout=15, stream=True, allow_redirects=False)
@@ -677,11 +1049,13 @@ def _parse_content(content: str | list | None) -> tuple[str, list[Image.Image]]:
                         if size > MAX_IMAGE_SIZE_MB * 1024 * 1024:
                             raise ValueError(f"Image exceeds {MAX_IMAGE_SIZE_MB}MB limit")
                         chunks.append(chunk)
-                    images.append(Image.open(io.BytesIO(b"".join(chunks))).convert("RGB"))
+                    img = Image.open(io.BytesIO(b"".join(chunks))).convert("RGB")
+                    images.append(_preprocess_image(img))
                 else:
                     if _validate_image_path(url):
                         with open(url, "rb") as fh:
-                            images.append(Image.open(fh).convert("RGB"))
+                            img = Image.open(fh).convert("RGB")
+                        images.append(_preprocess_image(img))
 
     return " ".join(text_parts), images
 
@@ -751,8 +1125,99 @@ def _prepare_inputs(
     messages: list[ChatMessage],
     tools: list[dict] | None = None,
     enable_thinking: bool = False,
+    session_id: Optional[str] = None,
 ):
-    """Tokenize messages with apply_chat_template; support tools, thinking, vision."""
+    """Tokenize messages with apply_chat_template; support tools, thinking, vision.
+
+    When RAG is enabled and messages exceed MAX_CONTEXT_MESSAGES, older messages
+    are stored in FAISS and relevant context is retrieved and injected as a
+    system message instead of being silently dropped.
+    """
+    # ── Inject default system prompt if none present ───────────────────────
+    has_system = any(m.role == "system" for m in messages)
+    if not has_system and DEFAULT_SYSTEM_PROMPT:
+        # Try to load cached system prompt for this session
+        session = _get_or_create_session(session_id or "default")
+        cached_prompt = session.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        messages = [ChatMessage(role="system", content=cached_prompt)] + list(messages)
+    elif has_system:
+        # Cache the system prompt for this session
+        for m in messages:
+            if m.role == "system" and isinstance(m.content, str) and m.content.strip():
+                _get_or_create_session(session_id or "default", system_prompt=m.content)
+                break
+
+    # ── Hard limit: reject requests exceeding MAX_INPUT_TOKENS ────────────
+    estimated_tokens = _estimate_tokens(messages)
+    if estimated_tokens > MAX_INPUT_TOKENS:
+        raise ValueError(
+            f"Input too large: ~{estimated_tokens} tokens exceeds limit of {MAX_INPUT_TOKENS}. "
+            f"Reduce message count or shorten long texts."
+        )
+
+    # ── Chunk long messages: store full text in RAG, use summary ──────────
+    if estimated_tokens > CHUNK_THRESHOLD_TOKENS:
+        messages = _chunk_messages(messages, session_id or "default")
+
+    # ── RAG: store overflow messages and retrieve relevant context ────────
+    rag_context = ""
+    budget = _get_context_budget(messages)  # Dynamic: fewer msgs when images present
+
+    if RAG_ENABLED and len(messages) > budget:
+        try:
+            rag = get_rag_store()
+            # Extract the latest user query for retrieval
+            last_user_msg = ""
+            for msg in reversed(messages):
+                if msg.role == "user":
+                    content = msg.content if isinstance(msg.content, str) else ""
+                    last_user_msg = content
+                    break
+
+            # Store older messages into RAG (using stable session_id)
+            overflow = messages[:-(budget - 1)]
+            rag.store_messages(session_id or "default", [
+                {"role": m.role, "content": m.content if isinstance(m.content, str) else str(m.content)}
+                for m in overflow if m.content
+            ])
+
+            # Retrieve relevant context
+            if last_user_msg:
+                rag_context = rag.retrieve(last_user_msg, session_id=session_id or "default")
+
+            # Trim to window: first (system) + last N-1
+            if messages[0].role == "system":
+                messages = [messages[0]] + messages[-(budget - 1):]
+            else:
+                messages = messages[-(budget):]
+            log.info(f"RAG: stored {len(overflow)} msgs, retrieved {len(rag_context)} chars (budget={budget})")
+        except Exception as exc:
+            log.warning(f"RAG failed (non-fatal): {exc}")
+            # Fallback: simple truncation
+            if messages[0].role == "system":
+                messages = [messages[0]] + messages[-(budget - 1):]
+            else:
+                messages = messages[-(budget):]
+    elif len(messages) > budget:
+        # RAG disabled: simple truncation (original behavior)
+        if messages[0].role == "system":
+            messages = [messages[0]] + messages[-(budget - 1):]
+        else:
+            messages = messages[-(budget):]
+        log.info(f"Trimmed context to {len(messages)} messages (budget={budget}, has_vision={budget < CONTEXT_MESSAGES_TEXT})")
+
+    # Inject RAG context as system message
+    if rag_context:
+        rag_msg = ChatMessage(
+            role="system",
+            content=f"Relevant context from earlier conversation:\n{rag_context}"
+        )
+        # Insert after existing system prompt or at position 0
+        if messages and messages[0].role == "system":
+            messages = [messages[0], rag_msg] + messages[1:]
+        else:
+            messages = [rag_msg] + messages
+
     has_images = False
     all_images: list[Image.Image] = []
     for msg in messages:
@@ -782,6 +1247,19 @@ def _prepare_inputs(
         for k, v in inputs.items()
     }
     input_len = inputs_gpu["input_ids"].shape[-1]
+    
+    # ── Final token count check (after chunking, with real tokenizer) ────
+    if input_len > MAX_INPUT_TOKENS:
+        raise ValueError(
+            f"Tokenized input ({input_len} tokens) exceeds limit ({MAX_INPUT_TOKENS}). "
+            f"The text was too long even after chunking. Shorten your message."
+        )
+    if input_len > CHUNK_THRESHOLD_TOKENS:
+        log.warning(
+            f"Large input: {input_len} tokens (threshold={CHUNK_THRESHOLD_TOKENS}). "
+            f"Generation may be slow on 12GB VRAM."
+        )
+    
     return inputs_gpu, input_len, has_images
 
 
@@ -793,11 +1271,13 @@ def generate_sync(
     stop: list[str] | None = None,
     tools: list[dict] | None = None,
     enable_thinking: bool = False,
+    session_id: Optional[str] = None,
 ) -> tuple[str, int, int, str | None, list[dict] | None]:
     """Run synchronous generation; return (text, prompt_tokens, completion_tokens, reasoning, tool_calls)."""
     model, processor = load_model(MODEL_PATH)
     inputs_gpu, input_len, _ = _prepare_inputs(
-        model, processor, messages, tools=tools, enable_thinking=enable_thinking
+        model, processor, messages, tools=tools, enable_thinking=enable_thinking,
+        session_id=session_id,
     )
 
     gen_kwargs: dict = {
@@ -850,6 +1330,8 @@ def generate_sync(
                     "arguments": args_str,
                 },
             })
+        # Auto-fix bare domains in URLs (e.g. "todorelatos.com" → "https://todorelatos.com")
+        tool_calls = _fix_tool_call_urls(tool_calls)
 
     # Stop sequence truncation
     if stop:
@@ -1019,6 +1501,10 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             f"max_tokens={req.max_tokens}"
         )
 
+        # ── Derive stable session ID for RAG ───────────────────────────────
+        # Priority: X-Session-ID header > hash of first user message > "default"
+        session_id = raw_request.headers.get("X-Session-ID") or _derive_session_id(req.messages)
+
         loop = asyncio.get_event_loop()
         rate_limit = await loop.run_in_executor(None, _get_key_rate_limit_sync, key_prefix)
 
@@ -1041,7 +1527,7 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             # Acquire before returning generator; released in generator's finally block
             await INFERENCE_SEMAPHORE.acquire()
             return EventSourceResponse(
-                _stream_generator(req, req_id, created, key_prefix, req_start, INFERENCE_SEMAPHORE),
+                _stream_generator(req, req_id, created, key_prefix, req_start, INFERENCE_SEMAPHORE, session_id),
                 media_type="text/event-stream",
             )
 
@@ -1052,10 +1538,13 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                 if req.reasoning_effort:
                     enable_thinking = req.reasoning_effort != "low"
 
-                response_text, prompt_tokens, completion_tokens, reasoning, tool_calls = await loop.run_in_executor(
-                    None, generate_sync,
-                    req.messages, req.max_tokens, req.temperature, req.top_p, req.stop,
-                    req.tools, enable_thinking,
+                response_text, prompt_tokens, completion_tokens, reasoning, tool_calls = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, generate_sync,
+                        req.messages, req.max_tokens, req.temperature, req.top_p, req.stop,
+                        req.tools, enable_thinking, session_id,
+                    ),
+                    timeout=GENERATION_TIMEOUT,
                 )
                 latency_ms = (time.time() - req_start) * 1000
                 await loop.run_in_executor(
@@ -1111,6 +1600,18 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                     status_code=400,
                     content=_error_response(str(exc), "invalid_request_error"),
                 )
+            except asyncio.TimeoutError:
+                log.error(f"[{req_id}] generation timeout ({GENERATION_TIMEOUT}s)")
+                torch.cuda.empty_cache()
+                gc.collect()
+                return JSONResponse(
+                    status_code=504,
+                    content=_error_response(
+                        f"Generation timed out after {GENERATION_TIMEOUT}s — input too large or model too slow. "
+                        f"Reduce message length and try again.",
+                        "timeout_error",
+                    ),
+                )
             except Exception as exc:
                 log.exception(f"[{req_id}] inference failed")
                 return JSONResponse(
@@ -1118,6 +1619,11 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                     content=_error_response(f"Generation failed: {str(exc)}", "server_error"),
                 )
     finally:
+        # Aggressive memory cleanup after every request (critical for 12GB VRAM)
+        asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: (gc.collect(), torch.cuda.empty_cache())
+        )
         with REQUESTS_IN_FLIGHT_LOCK:
             REQUESTS_IN_FLIGHT -= 1
 
@@ -1129,6 +1635,7 @@ async def _stream_generator(
     key_prefix: str,
     req_start: float,
     semaphore: asyncio.Semaphore,
+    session_id: str = "default",
 ) -> AsyncIterator[dict]:
     """Queue-bridged streaming: inference thread -> asyncio -> SSE."""
     loop = asyncio.get_running_loop()
@@ -1144,7 +1651,8 @@ async def _stream_generator(
 
             model, processor = load_model(MODEL_PATH)
             inputs_gpu, input_len, _ = _prepare_inputs(
-                model, processor, req.messages, tools=req.tools, enable_thinking=enable_thinking
+                model, processor, req.messages, tools=req.tools, enable_thinking=enable_thinking,
+                session_id=session_id,
             )
 
             streamer = TextIteratorStreamer(
@@ -1218,6 +1726,8 @@ async def _stream_generator(
                         "type": "function",
                         "function": {"name": func.get("name", ""), "arguments": args_str},
                     })
+                # Auto-fix bare domains in URLs
+                tool_calls = _fix_tool_call_urls(tool_calls)
 
             # Clean accumulated for token count
             clean_accumulated = parsed.get("content") or ""
@@ -1370,6 +1880,9 @@ async def _stream_generator(
                 yield {"event": "message", "data": "[DONE]"}
                 break
     finally:
+        # Aggressive memory cleanup after streaming (critical for 12GB VRAM)
+        gc.collect()
+        torch.cuda.empty_cache()
         semaphore.release()
 
 
