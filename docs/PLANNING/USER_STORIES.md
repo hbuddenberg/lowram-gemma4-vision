@@ -1,6 +1,6 @@
 # User Stories y Use Cases — lowram-gemma4-vision Phase 2
 
-**Versión:** 1.1.0 (Consolidado + OC fixes)  
+**Versión:** 1.2.0 (CC+OC+AGY review — 11 fixes aplicados)  
 **Fecha:** 2026-06-05  
 **Autores:** CC + OC + AGY (consolidación de 3 perspectivas)  
 **Proyecto:** lowram-gemma4-vision Phase 2 — Migración Python → Rust (mistral.rs + nginx)
@@ -283,7 +283,7 @@
    ```bash
    curl -s http://localhost:8080/v1/chat/completions \
      -H "Content-Type: application/json" \
-     -d "{\"model\":\"gemma4-heretic\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"¿Qué hay en esta imagen?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$IMG_B64\"}}]}]},\"max_tokens\":100}"
+     -d "{\"model\":\"gemma4-heretic\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"¿Qué hay en esta imagen?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$IMG_B64\"}}]}],\"max_tokens\":100}"
    ```
 3. mistral.rs decodifica imagen (JPEG → bitmap).
 4. Vision encoder (16 capas, 768d) procesa imagen → embeddings.
@@ -313,7 +313,8 @@
    ```bash
    AUDIO_B64=$(base64 -w0 /tmp/audio.wav)
    curl -s http://localhost:8080/v1/chat/completions \
-     -d "{\"model\":\"gemma4-heretic\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Transcribe esto\"},{\"type\":\"audio_url\",\"image_url\":{\"url\":\"data:audio/wav;base64,$AUDIO_B64\"}}]}]}"
+     -H "Content-Type: application/json" \
+     -d "{\"model\":\"gemma4-heretic\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Transcribe esto\"},{\"type\":\"audio_url\",\"image_url\":{\"url\":\"data:audio/wav;base64,$AUDIO_B64\"}}]}],\"max_tokens\":200}"
    ```
 2. mistral.rs decodifica audio vía FFmpeg (WAV → 16kHz mono).
 3. Audio encoder (12 capas, 1024d) procesa audio → embeddings.
@@ -322,6 +323,12 @@
 **Postcondiciones:**
 - Transcripción coherente
 - VRAM ≤ 8.5 GB
+
+**Flujos alternativos:**
+- 3A. Audio corrupto o formato inválido → 400 Invalid Request
+- 3B. FFmpeg no instalado → 500 Server Error
+- 3C. CUDA OOM durante audio encoder → 500 Server Error
+- 3D. Archivo > 50 MB → 413 Request Entity Too Large (nginx)
 
 ---
 
@@ -394,7 +401,8 @@
 **Actor:** System (systemd)  
 **Precondiciones:**
 - Servicio running
-- Service configurado con `Restart=on-failure`, `RestartSec=10`
+- `loginctl enable-linger hans` ejecutado (para persistir sin sesión activa)
+- Service configurado con `Restart=on-failure`, `RestartSec=10`, `StartLimitBurst=5`, `StartLimitIntervalSec=300`
 
 **Flujo principal:**
 1. Proceso mistralrs crash (CUDA OOM, segfault).
@@ -407,6 +415,11 @@
 - Servicio se recupera sin intervención
 - Logs muestran crash y restart
 
+**Flujos alternativos:**
+- 6A. Restart limit agotado (5 crashes en 300s) → servicio marcado `failed`, ejecutar `systemctl reset-failed gemma4-rs.service`
+- 6B. GPU no disponible post-crash → reinicio falla, esperar recuperación GPU o reiniciar sistema
+- 6C. VRAM no liberada tras crash → segundo inicio hace OOM, limpiar con `nvidia-smi --gpu-reset`
+
 ---
 
 ### UC-07: Monitoreo salud en producción
@@ -418,10 +431,22 @@
 **Flujo principal:**
 1. Hans configura cron job para health check cada 5 min.
 2. Script hace `curl http://localhost/health`.
-3. Si response != 200 OK → envía alerta.
-4. Hans revisa `journalctl --user -u gemma4-rs.service` para diagnóstico.
-5. Hans revisa `nvidia-smi` para VRAM.
-6. Hans reinicia servicio si necesario.
+3. Si curl falla (connection refused) → envía alerta.
+4. Script hace `curl http://localhost/v1/models` para verificar modelo cargado.
+5. Hans revisa `journalctl --user -u gemma4-rs.service` para diagnóstico.
+6. Hans revisa `nvidia-smi` para VRAM.
+7. Hans reinicia servicio si necesario.
+
+**Postcondiciones:**
+- Alerta enviada si servicio caído o modelo no cargado
+- Logs accesibles para diagnóstico
+- VRAM documentada
+- Servicio restaurado si fue necesario
+
+**Flujos alternativos:**
+- 7A. `/health` devuelve 200 pero `/v1/models` falla → modelo descargado, reiniciar servicio
+- 7B. Health check timeout → verificar servidor vivo (connection refused)
+- 7C. VRAM excede 8.5 GB → acción correctiva (restart o reducir contexto)
 
 ---
 
@@ -431,6 +456,7 @@
 **Precondiciones:**
 - Móvil conectado a misma red Wi-Fi (192.168.1.x)
 - App configurada con host `192.168.1.5:80`
+- nginx configurado con `listen 0.0.0.0:80` (no solo 127.0.0.1)
 
 **Flujo principal:**
 1. App envía request a `http://192.168.1.5/v1/chat/completions`.
@@ -440,6 +466,19 @@
 5. mistral.rs procesa request.
 6. Respuesta vuelve a través de nginx.
 7. App muestra respuesta.
+
+**Postcondiciones:**
+- App recibe respuesta 200 OK
+- Auth validada correctamente
+- Contenido de respuesta correcto
+- Tráfico permanece en LAN (no sale a internet)
+
+**Flujos alternativos:**
+- 8A. Auth falla (credenciales incorrectas) → 401 Unauthorized
+- 8B. Rate limit excedido → 429 Too Many Requests
+- 8C. mistral.rs caído → 502 Bad Gateway
+- 8D. Timeout de inferencia > 300s → 504 Gateway Timeout
+- 8E. Request body > 50 MB → 413 Request Entity Too Large
 
 ---
 
