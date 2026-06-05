@@ -1,6 +1,6 @@
 # PRD — lowram-gemma4-vision Phase 2: Migración a Rust
 
-**Version:** 2.1.0  
+**Version:** 2.2.0  
 **Fecha:** 2026-06-05  
 **Autor:** Hans-Dieter Buddenberg Blamey  
 **Status:** Approved  
@@ -89,9 +89,32 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 4. Alcance
+## 4. User Stories
 
-### 4.1 Incluido (IN SCOPE)
+**Ver USER_STORIES.md** para las 12 historias de usuario y 8 casos de uso completos con criterios de aceptación. Resumen:
+
+| ID | Historia | Prioridad | Rol | Fase |
+|----|----------|-----------|-----|------|
+| US-01 | Chat de texto vía curl | Must Have | Hans (curl) | 2A |
+| US-02 | Inferencia visión | Must Have | Hans (curl) | 2A |
+| US-03 | Inferencia audio | Must Have | Hans (curl) | 2A |
+| US-04 | Streaming SSE | Must Have | Mobile app dev | 2A |
+| US-05 | Discord bot | High | Hans (Discord) | Post-P2 |
+| US-06 | Mobile app multimodal | High | Mobile app user | 2B |
+| US-07 | API segura (auth+rate) | High | System admin | 2C |
+| US-08 | Service systemd auto-restart | High | System admin | 2B |
+| US-09 | Recursos ≤ presupuesto | Must Have | Hans (dev) | Todas |
+| US-10 | RAG búsqueda vectorial | Medium | Hans (end user) | Post-P2 |
+| US-11 | Health check / monitoreo | Medium | System admin | 2C |
+| US-12 | Despliegue reproducible scripts | High | Hans (dev) | 0-1 |
+
+**Casos de uso completos** (UC-01 a UC-08) documentados en USER_STORIES.md §2.
+
+---
+
+## 5. Alcance
+
+### 5.1 Incluido (IN SCOPE)
 
 - **Motor de inferencia:** mistral.rs compilado con CUDA + flash-attn + cudnn
 - **Cuantización:** ISQ Q4K in-situ desde safetensors (sin conversión GGUF)
@@ -104,7 +127,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 - **Configuración:** TOML para mistral.rs, nginx.conf para proxy
 - **Monitoreo:** nvidia-smi logging, journalctl
 
-### 4.2 Excluido (OUT OF SCOPE)
+### 5.2 Excluido (OUT OF SCOPE)
 
 - ~~vLLM~~ (descartado: requiere 3-5 GB RAM, 380 MB libre = OOM garantizado)
 - ~~llama.cpp / GGUF~~ (descartado: sin visión/audio para Gemma 4)
@@ -117,7 +140,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 5. Stack Tecnológico Final
+## 6. Stack Tecnológico Final
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -149,7 +172,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 6. Presupuesto VRAM Objetivo (ISQ Q4K)
+## 7. Presupuesto VRAM Objetivo (ISQ Q4K)
 
 > **⚠️ DATOS REALES del safetensors** — verificado por análisis de tensores individuales.
 > El componente `embed_tokens_per_layer` (5.64 GB fp16) es el **35% del modelo** y estaba ausente en la planificación original. Su cuantización determina la viabilidad del proyecto.
@@ -210,7 +233,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 7. Criterios de Aceptación
+## 8. Criterios de Aceptación
 
 ### Obligatorios (Must Have)
 
@@ -234,7 +257,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 8. Riesgos
+## 9. Riesgos
 
 | # | Riesgo | Probabilidad | Impacto | Mitigación |
 |---|---|---|---|---|
@@ -248,7 +271,7 @@ Correr Gemma 4 E4B multimodal (texto + visión + audio) en RTX 3060 12 GB con ma
 
 ---
 
-## 9. Dependencias de Sistema
+## 10. Dependencias de Sistema
 
 ### Requisitos Previos (verificar/instalar antes de empezar)
 
