@@ -1,357 +1,310 @@
-# Plan de Implementacion - lowram-gemma4-vision Phase 2
+# Plan de Implementación — lowram-gemma4-vision Phase 2
 
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
-
-**Goal:** Migrar inferencia de Python/transformers/bitsandbytes a mistral.rs para habilitar multimodal (text+vision+audio) en 12 GB VRAM.
-
-**Architecture:** FastAPI (API layer) -> mistralrs (Python bindings) -> mistral.rs (Rust, CUDA). RAG con FAISS se migra sin cambios.
-
-**Tech Stack:** Python 3.11, mistralrs (PyPI), FastAPI, FAISS-CPU, sentence-transformers, SQLite, Rust/CUDA (mistral.rs)
+**Version:** 2.1.0  
+**Fecha:** 2026-06-05  
+**Autor:** Hans-Dieter Buddenberg Blamey  
+**Branch:** phase2  
+**Duración estimada:** 7–10 días hábiles  
 
 ---
 
-## Task 1: Setup - Entorno y dependencias
+## Fase 0: Prerrequisitos (Día 1, ~1 hora)
 
-**Objective:** Crear entorno de trabajo con mistralrs instalado y verificado.
+### Objetivo
+Verificar dependencias del sistema y toolchain.
 
-**Files:**
-- Create: `requirements.txt`
-- Create: `config.py`
+### Tareas
 
-**Step 1: Crear requirements.txt**
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 0.1 | Instalar cudnn | `echo PASSWORD \| sudo -S pacman -S cudnn` | `pacman -Q cudnn` → versión |
+| 0.2 | Instalar nginx | `echo PASSWORD \| sudo -S pacman -S nginx` | `pacman -Q nginx` → versión |
+| 0.3 | **Verificar** FFmpeg (ya instalado) | `ffmpeg -version` | Muestra versión |
+| 0.4 | Verificar Rust | `rustc --version && cargo --version` | >= 1.96.0 |
+| 0.5 | Verificar CUDA | `/opt/cuda/bin/nvcc --version` | 13.3.33 |
+| 0.6 | Verificar GPU | `nvidia-smi` | RTX 3060, 12288 MiB |
+| 0.7 | Detener server.py | `systemctl --user stop gemma4-api.service` | `systemctl --user status gemma4-api.service` → inactive |
+| 0.8 | Verificar VRAM libre | `nvidia-smi --query-gpu=memory.free --format=csv,noheader` | > 10000 MiB (sin modelo cargado) |
 
-```
-# Inference (mistral.rs Python bindings)
-mistralrs>=0.4.0
-
-# API
-fastapi>=0.115.0
-uvicorn[standard]>=0.34.0
-sse-starlette>=2.0
-pydantic>=2.0
-
-# RAG
-faiss-cpu>=1.7.0
-sentence-transformers>=3.0.0
-
-# Image preprocessing
-Pillow>=10.0.0
-
-# Audio
-soundfile>=0.12.0
-
-# Utils
-requests>=2.28.0
-pyyaml>=6.0
-```
-
-**Step 2: Crear config.py**
-
-Archivo de configuracion centralizada con dataclasses (ModelConfig, ServerConfig, RAGConfig, BudgetConfig, ImageConfig). Carga desde YAML + env vars.
-
-**Step 3: Instalar dependencias**
-
-```bash
-cd ~/lowram-gemma4-vision
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
-
-**Step 4: Verificar mistralrs**
-
-```python
-from mistralrs import Runner, Which, MultimodalArchitecture
-print("mistralrs imported successfully")
-```
-
-**Step 5: Commit**
-
-```bash
-git add requirements.txt config.py
-git commit -m "chore: setup phase2 deps and config"
-```
+### Gate
+- [ ] cudnn, nginx instalados; FFmpeg verificado
+- [ ] Rust >= 1.96.0
+- [ ] CUDA 13.3.33
+- [ ] server.py detenido (libera VRAM para compilación)
 
 ---
 
-## Task 2: PoC - Cargar modelo y generar texto
+## Fase 1: Compilar mistral.rs (Día 1-2, ~30-60 min compilación)
 
-**Objective:** Verificar que mistral.rs carga el modelo heretic y genera texto correctamente.
+### Objetivo
+Compilar `mistralrs-cli` con soporte CUDA + flash-attn + cudnn.
 
-**Files:**
-- Create: `tests/test_text.py`
+### Tareas
 
-**Step 1: Escribir test de carga**
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 1.1 | Compilar mistral.rs | `cargo install mistralrs-cli --features "cuda flash-attn cudnn"` | `~/.cargo/bin/mistralrs --version` |
+| 1.2 | Verificar instalación | `mistralrs --help 2>&1 \| head -10` | Muestra opciones serve, run, etc. |
+| 1.3 | Verificar CUDA detectado | `mistralrs run --help 2>&1 \| grep -i cuda` | Menciona CUDA |
 
-```python
-from mistralrs import Runner, Which, MultimodalArchitecture, ChatCompletionRequest, SamplingParams
+### Posibles errores y fixes
 
-def test_load_and_generate():
-    runner = Runner(
-        which=Which.MultimodalPlain(
-            model_id="~/models/gemma4-heretic",
-            arch=MultimodalArchitecture.Gemma4,
-        ),
-        in_situ_quant="4",
-    )
-    request = ChatCompletionRequest(
-        model="gemma-4-e4b-heretic",
-        messages=[{"role": "user", "content": "Hola, dime un haiku sobre Python"}],
-        max_tokens=30,
-        sampling_params=SamplingParams(temperature=0.7, top_p=0.9),
-    )
-    response = runner.send_chat_completion_request(request)
-    assert response.choices[0].message.content
-    print(f"Response: {response.choices[0].message.content}")
-```
+| Error | Causa | Fix |
+|-------|-------|-----|
+| `cargo install` OOM | Compilación usa ~3GB RAM, zram saturado | Cerrar Chrome/otras apps antes de compilar. zram comprime en RAM, liberar Python da más espacio |
+| `cudnn` link error | cudnn no encontrado en paths | `export LD_LIBRARY_PATH=/opt/cuda/lib64:$LD_LIBRARY_PATH` |
+| flash-attn compile fail | No compatible con CUDA 13.3 | Quitar feature: `--features "cuda cudnn"` |
+| nvcc no encontrado | No está en PATH | `export PATH=/opt/cuda/bin:$PATH` |
 
-**Step 2: Ejecutar y verificar VRAM**
-
-```bash
-python3 tests/test_text.py
-nvidia-smi  # Debe mostrar < 5 GB VRAM usados
-```
-
-**Expected:** VRAM <= 5 GB, respuesta coherente en espanol.
-
-**Step 3: Commit**
-
-```bash
-git add tests/test_text.py
-git commit -m "test: PoC mistral.rs text inference"
-```
+### Gate
+- [ ] `mistralrs --version` funciona
+- [ ] Binario en `~/.cargo/bin/mistralrs`
 
 ---
 
-## Task 3: API Layer - FastAPI con mistral.rs runner
+## Fase 2: Verificar Carga del Modelo (Día 2, ~5 min)
 
-**Objective:** Reemplazar generate_sync() y _prepare_inputs() con mistral.rs Runner.
+### Objetivo
+Confirmar que mistral.rs carga el modelo heretic con ISQ Q4K y responde a texto. **Verificar si ISQ cuantiza `embed_tokens_per_layer`** (5.64 GB fp16, 35% del modelo).
 
-**Files:**
-- Create: `server.py` (nuevo, limpio)
-- Create: `tests/test_api.py`
+### Tareas
 
-**Step 1: Crear server.py minimal con FastAPI + mistralrs Runner + lifespan + /v1/chat/completions**
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 2.1 | Cargar modelo (interactive) | `mistralrs run --quant q4k -m ~/models/gemma4-heretic` | Carga sin error, prompt interactivo disponible |
+| 2.2 | **⚠️ Verificar embed_tokens_per_layer** | Observar logs de carga o `nvidia-smi` durante carga | Si VRAM ~5.3 GB → ISQ lo cuantizó ✅. Si VRAM ~9.5 GB → no lo cuantizó 🔴 |
+| 2.3 | Test texto | Escribir: "Hola, ¿cómo estás?" | Respuesta coherente en español |
+| 2.4 | Verificar VRAM tras carga | `nvidia-smi --query-gpu=memory.used --format=csv,noheader` | ≤ 5.5 GB (si ISQ cuantiza embed_tokens_per_layer) |
+| 2.5 | Verificar RAM del proceso | `ps aux \| grep mistralrs \| grep -v grep` | RSS ≤ 200 MB |
 
-**Step 2: Probar con curl**
+### Gate
+- [ ] Modelo carga sin error
+- [ ] Responde texto coherentemente
+- [ ] VRAM ≤ 5.5 GB idle (Escenario A) — **si VRAM > 9 GB, documentar como Escenario B**
+- [ ] RAM ≤ 200 MB
 
-```bash
-curl -s http://localhost:11434/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gemma-4-e4b-heretic","messages":[{"role":"user","content":"Hola"}],"max_tokens":10}'
-```
-
-**Expected:** 200 OK con respuesta del modelo.
-
-**Step 3: Commit**
-
-```bash
-git add server.py tests/test_api.py
-git commit -m "feat: FastAPI server with mistral.rs runner"
-```
-
----
-
-## Task 4: Streaming SSE
-
-**Objective:** Implementar Server-Sent Events para streaming.
-
-**Files:**
-- Modify: `server.py`
-
-**Step 1: Agregar endpoint streaming con EventSourceResponse**
-
-```python
-async def _stream(req):
-    for chunk in runner.send_chat_completion_request_stream(request):
-        yield f"data: {chunk.model_dump_json()}\n\n"
-    yield "data: [DONE]\n\n"
-```
-
-**Step 2: Probar con curl -N**
-
-**Step 3: Commit**
-
-```bash
-git commit -am "feat: SSE streaming support"
-```
+### ⚠️ Si esta fase falla
+- Verificar que config.json tiene `model_type: "gemma4"` y `architectures: ["Gemma4ForConditionalGeneration"]`
+- Probar sin ISQ: `mistralrs run -m ~/models/gemma4-heretic` (fp16, usará más VRAM pero confirma compatibilidad)
+- Verificar logs: `RUST_LOG=debug mistralrs run --quant q4k -m ~/models/gemma4-heretic 2>&1 | tee /tmp/mistralrs-debug.log`
+- **Si embed_tokens_per_layer no se cuantiza:** evaluar offload a CPU/RAM de ese tensor, o operar en modo texto-only con headroom limitado
 
 ---
 
-## Task 5: Vision - Procesamiento de imagenes
+## Fase 3: Verificar Multimodal (Día 2, ~15 min)
 
-**Objective:** Habilitar inferencia con imagenes sin OOM.
+### Objetivo
+Confirmar que visión y audio funcionan con el modelo heretic.
 
-**Files:**
-- Create: `image.py` (preprocessing: resize a 896px)
-- Modify: `server.py` (soporte multimodal en messages)
-- Create: `tests/test_vision.py`
+### Tareas
 
-**Step 1: Crear image.py con preprocess_image()**
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 3.1 | Iniciar servidor | `mistralrs serve --quant q4k --port 8080 -m ~/models/gemma4-heretic &` | Escuchando en :8080 |
+| 3.2 | Test texto via HTTP | `curl -s http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gemma4-heretic","messages":[{"role":"user","content":"Di OK"}],"max_tokens":10}'` | 200 OK, response contiene "OK" |
+| 3.3 | Test texto + VRAM | `nvidia-smi --query-gpu=memory.used --format=csv,noheader` | ≤ 5.5 GB (Escenario A) |
+| 3.4 | Generar imagen de test con FFmpeg | `ffmpeg -f lavfi -i color=c=red:s=200x200:d=0.1 -frames:v 1 /tmp/test_img.jpg` | Archivo existe |
+| 3.5 | Test visión (base64) | Ver comando abajo | 200 OK, describe color rojo |
+| 3.6 | Verificar VRAM con visión | `nvidia-smi --query-gpu=memory.used --format=csv,noheader` | ≤ 7.0 GB (Escenario A) |
+| 3.7 | Test audio | Generar WAV + enviar request | 200 OK, respuesta coherente |
+| 3.8 | Verificar VRAM con audio | `nvidia-smi --query-gpu=memory.used --format=csv,noheader` | ≤ 7.0 GB (Escenario A) |
+| 3.9 | Test streaming | `curl -N http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gemma4-heretic","messages":[{"role":"user","content":"Cuenta del 1 al 5"}],"max_tokens":50,"stream":true}'` | Chunks SSE incrementales |
 
-**Step 2: Formato multimodal para mistral.rs:**
-```python
-messages = [
-    {"role": "user", "content": [
-        {"type": "text", "text": "Describe esta imagen"},
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-    ]}
-]
-```
-
-**Step 3: Probar con curl + base64 image**
-
-**Step 4: Verificar VRAM < 8 GB con imagen**
-
-**Step 5: Commit**
-
+### Comando test visión (3.5)
 ```bash
-git add image.py server.py tests/test_vision.py
-git commit -m "feat: vision inference with image preprocessing"
+IMG_B64=$(base64 -w0 /tmp/test_img.jpg)
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"gemma4-heretic\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"¿De qué color es esta imagen?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,${IMG_B64}\"}}]}],\"max_tokens\":50}"
 ```
+
+### Gate
+- [ ] Texto: 200 OK, VRAM ≤ 5.5 GB (Escenario A)
+- [ ] Visión: 200 OK, describe imagen, VRAM ≤ 7.0 GB (Escenario A)
+- [ ] Audio: 200 OK, respuesta coherente, VRAM ≤ 7.0 GB (Escenario A)
+- [ ] Streaming: chunks SSE funcionan
+- [ ] Sin CUDA OOM en ningún test
+
+### ⚠️ Si visión falla
+- Puede ser que ISQ no cuantiza correctamente los projectors de visión
+- Probar sin ISQ para aislar: es un problema de cuantización o de arquitectura
+- Revisar `mistralrs` issues en GitHub sobre Gemma 4 vision + ISQ
 
 ---
 
-## Task 6: Audio
+## Fase 4: Configurar nginx (Día 3, ~30 min)
 
-**Objective:** Probar si audio funciona con Gemma 4 E4B + mistral.rs.
+### Objetivo
+Configurar reverse proxy con auth y rate limiting.
 
-**Riesgo:** Gemma 4 E4B puede no tener encoder de audio (solo 12B/27B).
+### Tareas
 
-**Step 1: Verificar soporte con WAV simple**
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 4.1 | Crear config nginx | Copiar config del TRD (Sección 6) | Archivo en `/etc/nginx/conf.d/gemma4-rs.conf` |
+| 4.2 | Crear htpasswd | `echo PASSWORD \| sudo -S htpasswd -c /etc/nginx/.htpasswd hbuddenberg` | Archivo creado |
+| 4.3 | Test config | `echo PASSWORD \| sudo -S nginx -t` | `syntax is ok`, `test is successful` |
+| 4.4 | Iniciar nginx | `echo PASSWORD \| sudo -S systemctl enable --now nginx` | Running |
+| 4.5 | Test auth correcta | `curl -u hbuddenberg:PASSWORD http://localhost/v1/models` | 200 OK |
+| 4.6 | Test auth incorrecta | `curl http://localhost/v1/models` | 401 Unauthorized |
+| 4.7 | Test proxy a mistralrs | `curl -s -u hbuddenberg:PASSWORD http://localhost/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gemma4-heretic","messages":[{"role":"user","content":"OK"}],"max_tokens":5}'` | 200 OK con respuesta |
+| 4.8 | Configurar LAN access | Cambiar `listen 80` → `listen 0.0.0.0:80` en nginx conf | Accesible desde 192.168.1.x |
+| 4.9 | Test desde LAN | `curl -u hbuddenberg:PASSWORD http://192.168.1.XX/v1/models` (ejecutar desde otro dispositivo en la red, ej: móvil o laptop) | 200 OK |
 
-**Step 2: Si funciona -> integrar. Si no -> documentar como Future.**
-
-**Step 3: Commit**
-
-```bash
-git commit -m "feat: audio inference (if supported)"
-```
-
----
-
-## Task 7: RAG Integration
-
-**Objective:** Migrar modulo RAG (FAISS) desde Phase 1.
-
-**Files:**
-- Copy: `rag.py` (desde master)
-- Modify: `server.py` (integrar RAG)
-
-**Step 1: Copiar rag.py desde master: `git checkout master -- rag.py`**
-
-**Step 2: Integrar en server.py - aplicar RAG antes de pasar a runner**
-
-**Step 3: Probar con 10 mensajes (overflow + retrieval)**
-
-**Step 4: Commit**
-
-```bash
-git add rag.py server.py
-git commit -m "feat: RAG integration with FAISS"
-```
+### Gate
+- [ ] Auth funciona (401 sin credenciales, 200 con)
+- [ ] Proxy pasa requests a mistralrs
+- [ ] Accesible desde LAN
 
 ---
 
-## Task 8: Auth + Rate Limit + Logging
+## Fase 5: Systemd Service (Día 3, ~15 min)
 
-**Objective:** Migrar seguridad y monitoreo desde Phase 1.
+### Objetivo
+Crear servicio systemd para auto-inicio.
 
-**Files:**
-- Modify: `server.py`
-- Copy: SQLite schema (desde master)
+### Tareas
 
-**Step 1:** Copiar logica de auth, rate limiting, request logging desde master/server.py.
+| # | Tarea | Comando | Verificación |
+|---|-------|---------|-------------|
+| 5.1 | Crear service file | Copiar del TRD (Sección 7) | `~/.config/systemd/user/gemma4-rs.service` |
+| 5.2 | Reload daemon | `systemctl --user daemon-reload` | Sin error |
+| 5.3 | Enable + start | `systemctl --user enable --now gemma4-rs.service` | Running |
+| 5.4 | Verificar | `systemctl --user status gemma4-rs.service` | Active (running) |
+| 5.5 | Test via nginx | curl al endpoint nginx | 200 OK |
+| 5.6 | Test restart | `systemctl --user restart gemma4-rs.service` | Reinicia correctamente |
+| 5.7 | Test crash recovery | Matar proceso, verificar auto-restart | `RestartSec=10` funciona |
 
-**Step 2:** Adaptar a nueva estructura (misma interfaz, diferente runner).
-
-**Step 3: Probar todos los endpoints de auth.
-
-**Step 4: Commit**
-
-```bash
-git commit -m "feat: auth, rate limiting, request logging"
-```
-
----
-
-## Task 9: systemd Service
-
-**Objective:** Crear/actualizar servicio systemd.
-
-**Files:**
-- Modify: `gemma4-api.service`
-
-**Step 1: Actualizar ExecStart para usar nuevo server.py**
-
-**Step 2: Reload + restart**
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart gemma4-api.service
-```
-
-**Step 3: Commit**
-
-```bash
-git commit -am "chore: update systemd service for phase2"
-```
+### Gate
+- [ ] Service arranca, para, reinicia correctamente
+- [ ] Auto-restart en crash funciona
 
 ---
 
-## Task 10: Benchmark + Validation
+## Fase 6: Benchmarks (Día 4, ~30 min)
 
-**Objective:** Medir metricas y comparar con Phase 1.
+### Objetivo
+Medir VRAM, RAM y latencia reales. Comparar con Phase 1.
 
-**Files:**
-- Create: `tests/benchmark.py`
+### Tareas
 
-**Step 1: Medir VRAM en cada modo (idle, text, vision, rag)**
+| # | Métrica | Comando | Target |
+|---|---------|---------|--------|
+| 6.1 | VRAM idle | `nvidia-smi --query-gpu=memory.used --format=csv,noheader` | ≤ 5.5 GB (Escenario A) |
+| 6.2 | VRAM inferencia texto | Medir durante curl text | ≤ 6.0 GB |
+| 6.3 | VRAM inferencia visión | Medir durante curl con imagen | ≤ 7.0 GB |
+| 6.4 | VRAM inferencia audio | Medir durante curl con audio | ≤ 7.0 GB |
+| 6.5 | RAM proceso | `ps -p $(pgrep mistralrs) -o rss=` | ≤ 200 MB |
+| 6.6 | Latencia text (128 tok) | `time curl ...` | ≤ 15s |
+| 6.7 | Latencia vision | `time curl ... con imagen` | ≤ 20s |
+| 6.8 | Tokens/segundo | Extraer del response | ≥ 3 tok/s |
+| 6.9 | RAM libre sistema | `free -h` | ≥ 1.5 GB (vs 380 MB worst-case Phase 1) |
 
-**Step 2: Comparar contra targets**
+### Tabla de comparación (llenar con datos reales)
 
-| Metrica | Phase 1 | Phase 2 Target |
-|---|---|---|
-| VRAM idle | 9.3 GB | <= 3.0 GB |
-| VRAM text | ~10.0 GB | <= 4.0 GB |
-| VRAM vision | OOM | <= 6.0 GB |
-| Latencia text (128 tok) | ~2.5s | <= 3.0s |
+| Métrica | Phase 1 (server.py) | Phase 2 (mistral.rs) | Mejora |
+|---------|---------------------|---------------------|--------|
+| VRAM idle | 9.3 GB | _ | _ |
+| VRAM text | ~10 GB | _ | _ |
+| VRAM vision | OOM 🔴 | _ | _ |
+| RAM engine | 1.6 GB | _ | _ |
+| RAM libre | 380 MB (worst-case) | _ | _ |
+| Latencia text (128 tok) | ~4.2s | _ | _ |
+| Tokens/s | ~4.2 | _ | _ |
 
-**Step 3: Commit**
-
-```bash
-git add tests/benchmark.py
-git commit -m "test: benchmark suite phase2"
-```
-
----
-
-## Task 11: Cleanup + Release
-
-**Objective:** Limpiar, documentar, y taggear release.
-
-**Step 1:** Actualizar README.md con instrucciones Phase 2.
-
-**Step 2:** Verificar todos los tests pasan.
-
-**Step 3:** Tag release.
-
-```bash
-git tag -a v2.0.0 -m "Phase 2: mistral.rs multimodal inference"
-git push origin phase2 --tags
-```
+### Gate
+- [ ] Todos los targets cumplidos
+- [ ] Tabla de comparación completada
 
 ---
 
-## Timeline
+## Fase 7: Cleanup y Documentación (Día 5, ~1 hora)
 
-| Semana | Tasks |
-|---|---|
-| 1 | T1-T4: Setup, PoC, API, Streaming |
-| 2 | T5-T8: Vision, Audio, RAG, Auth |
-| 3 | T9-T11: Service, Benchmark, Release |
+### Objetivo
+Limpiar Phase 1, documentar resultados, preparar release.
 
-## Open Questions (resolver en T2)
+### Tareas
 
-1. mistralrs PyPI wheel incluye CUDA o solo CPU? Si CPU, necesitamos compilar desde fuente.
-2. `in_situ_quant="4"` es compatible con modelo abliterated (heretic)?
-3. Audio funciona en E4B o solo en 12B/27B?
-4. Tool calling de Gemma 4 funciona via mistral.rs?
+| # | Tarea | Detalle |
+|---|-------|---------|
+| 7.1 | Deshabilitar servicio viejo | `systemctl --user disable gemma4-api.service` (servicio Python Phase 1) |
+| 7.2 | Actualizar Hermes config | Cambiar provider a `http://localhost/v1` (via nginx) |
+| 7.3 | Commit docs + config | `git add -A && git commit -m "Phase 2: mistral.rs migration"` |
+| 7.4 | Push a GitHub | `git push origin phase2` |
+| 7.5 | Limpiar archivos viejos | Archivar o borrar server.py, rag.py, inference.py de master |
+| 7.6 | README.md | Instrucciones de deploy: install, config, start, test |
+| 7.7 | Screenshot VRAM | Captura de nvidia-smi post-migración |
+| 7.8 | Test end-to-end Discord | Enviar mensaje desde Discord → Hermes → mistral.rs → respuesta |
+
+### Gate
+- [ ] Servicio viejo deshabilitado
+- [ ] Hermes actualizado y funcionando con mistral.rs
+- [ ] GitHub actualizado
+- [ ] README con instrucciones completas
+
+---
+
+## Cronograma
+
+| Día | Fase | Entregable |
+|-----|------|-----------|
+| **1** | 0: Prerrequisitos | Deps instaladas/verificadas, toolchain verificado |
+| **1-2** | 1: Compilar mistral.rs | Binario compilado |
+| **2** | 2: Verificar modelo | Carga + texto OK + **verificar embed_tokens_per_layer ISQ** |
+| **2** | 3: Verificar multimodal | Visión + audio + streaming OK |
+| **3** | 4: nginx | Reverse proxy con auth |
+| **3** | 5: systemd | Auto-start service |
+| **4** | 6: Benchmarks | Tabla comparativa |
+| **5** | 7: Cleanup | Release listo |
+| **6-10** | Buffer | RAG post-migración (opcional) |
+
+---
+
+## Riesgos y Mitigaciones
+
+| # | Riesgo | Probabilidad | Impacto | Mitigación |
+|---|-------|-------------|---------|------------|
+| R1 | **ISQ no cuantiza embed_tokens_per_layer (5.64 GB)** | **Alta** | **Crítico** | ⚠️ Verificar en Fase 2. Si falla: evaluar offload CPU/RAM, modo texto-only, o conversión selectiva a GGUF de ese tensor |
+| R2 | Compilación OOM (RAM insuficiente, zram saturado) | Alta | Medio | Cerrar apps, zram es más flexible que swap file. Si falla: compilar en otra máquina y copiar binario |
+| R3 | ISQ no funciona con heretic | Media | Alto | Probar sin ISQ (fp16) primero. Si fp16 funciona, ISQ debería también |
+| R4 | Visión "ciega" con ISQ | Media | Alto | ISQ solo cuantiza LM, encoders permanecen fp16. Verificar en Fase 3 |
+| R5 | flash-attn no compila con CUDA 13.3 | Media | Bajo | Quitar feature, usar standard attention (más lento pero funcional) |
+| R6 | VRAM excede budget con audio+visión (Escenario B) | Baja-Media | Alto | Reducir max_seq_len o KV cache size. En Escenario B, headroom es muy limitado |
+| R7 | nginx auth bloquea Hermes | Media | Alto | Hermes envía API key en header. Verificar config Hermes provider |
+| R8 | Audio no soportado en E4B | Baja | Medio | Verificar en Fase 3. Si falla, documentar como "text+vision only" |
+
+---
+
+## Checklist de Verificación Final
+
+- [ ] `mistralrs serve` arranca sin error
+- [ ] `/v1/chat/completions` texto → 200 OK
+- [ ] `/v1/chat/completions` con imagen → 200 OK, describe imagen
+- [ ] `/v1/chat/completions` con audio → 200 OK (o documentar como no soportado)
+- [ ] `/v1/chat/completions` con `stream:true` → SSE chunks
+- [ ] **embed_tokens_per_layer cuantizado por ISQ** → VRAM ~5.3 GB (o documentar Escenario B)
+- [ ] VRAM idle ≤ 5.5 GB (Escenario A) / ≤ 9.5 GB (Escenario B)
+- [ ] VRAM multimodal ≤ 7.0 GB (Escenario A)
+- [ ] RAM proceso ≤ 200 MB
+- [ ] nginx auth funciona (401/200)
+- [ ] systemd `gemma4-rs.service` auto-restart OK
+- [ ] Accesible desde LAN (192.168.1.x)
+- [ ] Hermes gateway conecta correctamente
+- [ ] Benchmarks documentados
+- [ ] README actualizado
+- [ ] Git commit + push
+
+---
+
+## Comandos de Rollback
+
+```bash
+# Si todo falla, volver a Phase 1:
+systemctl --user stop gemma4-rs.service
+systemctl --user disable gemma4-rs.service
+echo PASSWORD | sudo -S systemctl stop nginx
+systemctl --user start gemma4-api.service  # Restaurar servidor Python
+
+# Verificar restauración:
+curl -s http://localhost:11434/v1/models  # Debería responder
+```
